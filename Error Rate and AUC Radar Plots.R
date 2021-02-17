@@ -1,8 +1,8 @@
 library(fmsb)
 
 #### AUC ####
-dataAUC =as.data.frame(cbind(100, 100, 100))
-dataAUC = rbind(dataAUC, c(90, 90, 90))
+dataAUC =as.data.frame(cbind(100, 100, 100)) # Max Value in Radar
+dataAUC = rbind(dataAUC, c(90, 90, 90)) # Min Value in Radar
 dataAUC = rbind(dataAUC, c(97.5, 95, 95.3))
 dataAUC = rbind(dataAUC, c(90.5, 90.5, 94.8))
 dataAUC = rbind(dataAUC, c(94.2, 91.4, 95.2))
