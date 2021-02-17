@@ -1,0 +1,2870 @@
+#################################################################################################
+##### FOR ANY ERRORS OR DOUBTS ABOUT THE SCRIPT, PLEASE CONTACT m.ensenyat.mendez@gmail.com #####
+#################################################################################################
+
+library(MASS)
+library(pamr)
+library(gtools)
+library(ROCR)
+library(varSelRF)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(Rtsne)
+library(RColorBrewer)
+library(gplots)
+library(psych)
+library(dendextend)
+
+#### GENE EXPRESSION ####
+ClinAll = read.csv("Clinical_Data_TCGA.csv", sep=";", header=TRUE) # Clinical Data downlaoded from cBioPortal and curated in Excel
+GBMAll = read.table("GBM_u133.txt", sep="\t", header=TRUE, row.names=1) # Downloaded from Firehose
+
+colnames(GBMAll)=substr(colnames(GBMAll), 1, 12)
+GBMAll = GBMAll[-1,]
+GBMAll = GBMAll[,which(colnames(GBMAll)%in%ClinAll$Patient.ID)]
+
+GBMAll = data.frame(apply(GBMAll, 2, function(x) as.numeric(as.character(x))), row.names = rownames(GBMAll))
+GBMAll_t = as.data.frame(as.matrix(t(GBMAll)))
+
+ClinAll = ClinAll[which(ClinAll$Patient.ID %in% rownames(GBMAll_t)),]
+Clin_cl = ClinAll[which(ClinAll$Calculated.subtype == "Classical"),]
+Clin_me = ClinAll[which(ClinAll$Calculated.subtype == "Mesenchymal"),]
+Clin_pn = ClinAll[which(ClinAll$Calculated.subtype == "Proneural"),]
+
+# Remove 25% of patients with lower expression
+GBM.mean = apply(GBMAll_t, 2, mean)
+low = quantile(GBM.mean, prob=0.25)
+GBMHigh = GBMAll[which(GBM.mean>low),]
+GBMAll_t = GBMHigh
+GBMAll = as.data.frame(as.matrix(t(GBMAll_t)))
+
+# Compute Z-score
+GBM = scale(GBMAll)
+GBM_t = as.data.frame(as.matrix(t(GBM)))
+
+#### CLASSICAL ####
+Clin_cl = ClinAll[which(ClinAll$Classical == "Classical"),]
+Clin_cont = ClinAll[which(ClinAll$Classical == "Control"),]
+barcodeCL = Clin_cl$Patient.ID
+barcodeCont = Clin_cont$Patient.ID
+
+Gene_Cl = GBM[which(rownames(GBM) %in% barcodeCL),]
+Gene_Cl_t = as.data.frame(as.matrix(t(Gene_Cl)))
+
+Gene_Cont = GBM[which(!rownames(GBM) %in% barcodeCL),]
+Gene_Cont_t = as.data.frame(as.matrix(t(Gene_Cont)))
+
+CL.mean = apply(Gene_Cl_t, 1, mean)
+CONTR.mean = apply(Gene_Cont_t, 1, mean)
+
+fold_Cl = (CL.mean-CONTR.mean)
+Zratio_Cl = (fold_Cl/sd(fold_Cl))
+
+# Compute statistical significance #
+pvalue_Cl = NULL
+tstat_Cl = NULL
+for(i in 1 : nrow(Gene_Cl_t)) {
+  x = Gene_Cl_t[i,]
+  y = Gene_Cont_t[i,]
+  
+  t = t.test(x, y) 
+  pvalue_Cl[i] = t$p.value
+  tstat_Cl[i] = t$statistic
+}
+
+qvalue_Cl = p.adjust(pvalue_Cl, method = "fdr", n = length(pvalue_Cl)) # Correction by False Discovery Rate
+
+combined_Cl  = cbind(qvalue_Cl, Zratio_Cl, abs(Zratio_Cl), GBM_t)
+
+# Filter per Z-Ratio and qvalue #
+Zratio_cutoff = 1.5
+qvalue_cutoff = 0.05
+
+# Zratio-change filter for "biological" significance
+filter_by_Zratio_Cl = abs(Zratio_Cl) >= Zratio_cutoff
+dim(GBM_t[filter_by_Zratio_Cl, ]) 
+
+# P-value filter for "statistical" significance
+filter_by_qvalue_Cl = qvalue_Cl <= qvalue_cutoff
+dim(GBM_t[filter_by_qvalue_Cl, ]) 
+
+# Combined filter (both biological and statistical)
+filter_combined_Cl = filter_by_Zratio_Cl & filter_by_qvalue_Cl 
+
+filtered_Cl = GBM_t[filter_combined_Cl,]
+dim(filtered_Cl)
+filtered_combined_Cl = merge(combined_Cl, filtered_Cl, by=0)
+genes_with_changes_Cl = filtered_combined_Cl[,1:4]
+UpGenes_Cl = genes_with_changes_Cl$Row.names[which(genes_with_changes_Cl$Zratio>0)]
+DownGenes_Cl = genes_with_changes_Cl$Row.names[which(genes_with_changes_Cl$Zratio<0)]
+write.table(genes_with_changes_Cl, file = "DEG_Classical.csv", sep = ";")
+
+# Create dataframe with Subtype data #
+tumorMetadata_Cl = cbind("Patient.ID" = as.character(ClinAll$Patient.ID), "Classical" = as.character(ClinAll$Classical))
+filtered_t_Cl = as.data.frame(as.matrix(t(filtered_Cl)))
+filtered_metadata_Cl = merge(tumorMetadata_Cl, filtered_t_Cl, by.x=1, by.y=0)
+rownames(filtered_metadata_Cl) = filtered_metadata_Cl[,1]
+names(filtered_metadata_Cl) = c(as.character(colnames(tumorMetadata_Cl)), as.character(colnames(filtered_t_Cl)))
+tumorLabels_Cl = as.character(filtered_metadata_Cl$Classical)
+plottingColors = c("Red", "cadetblue")
+names(plottingColors) = unique(tumorLabels_Cl)
+
+filtered_metadata_t_Cl = as.data.frame(as.matrix(t(filtered_metadata_Cl)))
+filtered_clean_Cl = filtered_metadata_Cl[,-c(1,2)]
+filtered_clean_t_Cl = as.data.frame(as.matrix(t(filtered_clean_Cl)))
+
+
+# Use Random Forest and Nearest Shrunken Centroid to select the features for the panel #
+Cl_Genes = lapply(1:300,
+                  function(x){
+                    
+                    # Random Forest #
+                    RF_Cl = varSelRF(filtered_clean_Cl, as.factor(tumorLabels_Cl), c.sd = 2, mtryFactor = 1, ntree = 1000,
+                                     ntreeIterat = 500, vars.drop.num = NULL, vars.drop.frac = 0.2,
+                                     whole.range = TRUE, recompute.var.imp = TRUE, verbose = FALSE,
+                                     returnFirstForest = FALSE, fitted.rf = NULL, keep.forest = FALSE)
+                    
+                    sel_hist = RF_Cl$selec.history
+                    sel_hist=sel_hist[order(sel_hist$Number.Variables),]
+                    sel_hist=sel_hist[order(sel_hist$OOB),]
+                    sel_hist2=data.frame(x = sel_hist$Vars.in.Forest)
+                    All_variables = sel_hist2 %>% separate(x, as.character(1:ncol(filtered_clean_Cl)))
+                    sel_genes = na.omit(as.factor(All_variables[1,]))
+                    sel_genes = droplevels.factor(sel_genes)
+                    RF_genes = as.vector(sel_genes)
+                    
+                    # Nearest Shrunken Centroid #
+                    filt100_t = filtered_clean_t_Cl[which(rownames(filtered_clean_t_Cl) %in% RF_genes),]
+                    filt100 = as.data.frame(as.matrix(t(filt100_t)))
+                    subsetCentroid = as.data.frame(as.matrix(t(filt100)))
+                    
+                    data_All = list(x = as.matrix(subsetCentroid), y = as.vector(tumorLabels_Cl), 
+                                    geneid = rownames(subsetCentroid),
+                                    genenames = paste("g",as.character(1:nrow(subsetCentroid)),sep=""))
+                    
+                    training_All = pamr.train(data_All)
+                    valid_All = pamr.cv(training_All, data_All)
+                    valid_All
+                    Genes1 = pamr.listgenes(training_All, data_All, threshold = 0.5, fitcv=valid_All)
+                    Genes1Up = Genes1[,1][which(Genes1[,2]>0)]
+                    Genes1Down = Genes1[,1][which(Genes1[,2]<0)]
+                    selected_genes = c(Genes1Up[1:2], Genes1Down[1:2], as.character(Genes1[,1]))
+                    selected_genes = unique(selected_genes)[1:5]
+                    
+                    print(x)
+                    
+                    selected_genes
+                  })
+
+
+Cl_Genes_Sorted = lapply(1:300,
+                         function(k){
+                           sort(Cl_Genes[[k]])
+                         })  
+
+# Select the most repeated combination #
+n.obs = sapply(Cl_Genes_Sorted, length)
+seq.max = seq_len(max(n.obs))
+ClComb = as.data.frame(t(sapply(Cl_Genes_Sorted, "[", i = seq.max)))
+
+get_perm = function(v) {
+  m = permutations(n = length(v), r = length(v), v = v, set = F)
+  m[order(c(m))]
+}
+All = map(Cl_Genes_Sorted, get_perm)
+unique = map(Cl_Genes_Sorted, get_perm) %>% unique()
+res_vec = c()
+element = c()
+
+for(i in seq_along(unique)) {
+  element[[i]] = unique[[i]] %>% unique() %>% paste(collapse = ",")
+  res_vec[[i]] = All %in% unique[i] %>% sum()
+}
+
+repetitions_Cl=tibble(
+  elements = unlist(element),
+  numbers = res_vec
+)
+
+repeat1_Cl = repetitions_Cl[order(-as.numeric(repetitions_Cl$numbers)),]
+CLgenes = strsplit(as.character(repeat1_Cl[1,1]), ",")
+CLgenes = CLgenes[[1]]
+
+# Create centroids in groups of 50 patients #
+colorROC = rep(brewer.pal(n = 9, name = "YlOrRd"), 17)
+pdf("ROC_Classical_GeneExp.pdf")
+Centr100_Cl = lapply(1:300,
+                     function(x){
+                       Clin_cl_t = as.data.frame(as.matrix(t(Clin_cl)))
+                       Clin_cl30 = as.data.frame(as.matrix(t(sample(Clin_cl_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin_me_t = as.data.frame(as.matrix(t(Clin_me)))
+                       Clin_me30 = as.data.frame(as.matrix(t(sample(Clin_me_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin_pn_t = as.data.frame(as.matrix(t(Clin_pn)))
+                       Clin_pn30 = as.data.frame(as.matrix(t(sample(Clin_pn_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin = rbind(Clin_cl30, Clin_me30, Clin_pn30)
+                       
+                       GBM = GBMAll[which(rownames(GBMAll) %in% Clin$Patient.ID),]
+                       GBM = scale(GBM90)
+                       GBM_t = as.data.frame(as.matrix(t(GBM)))
+                       barcode = rownames(GBM)
+                       
+                       tumorMetadata_Cl = cbind("Patient.ID" = as.character(Clin$Patient.ID), "Classical" = as.character(Clin$Classical))
+                       filtered_t_Cl = GBM[,which(colnames(GBM)%in%CLgenes)]
+                       filtered_metadata_Cl = merge(tumorMetadata_Cl, filtered_t_Cl, by.x=1, by.y=0)
+                       names(filtered_metadata_Cl) = c(as.character(colnames(tumorMetadata_Cl)), as.character(colnames(filtered_t_Cl)))
+                       tumorLabels_Cl = as.character(filtered_metadata_Cl$Classical)
+                       plottingColors = c("Red", "cadetblue")
+                       names(plottingColors) = unique(tumorLabels_Cl)
+                       
+                       filtered_metadata_t_Cl = as.data.frame(as.matrix(t(filtered_metadata_Cl)))
+                       filtered_clean_Cl = filtered_metadata_Cl[,-c(1,2)]
+                       filtered_clean_t_Cl = as.data.frame(as.matrix(t(filtered_clean_Cl)))
+                       
+                       
+                       data_All = list(x = as.matrix(filtered_clean_t_Cl), y = as.vector(tumorLabels_Cl), 
+                                       geneid = rownames(filtered_clean_t_Cl),
+                                       genenames = paste("g",as.character(1:nrow(filtered_clean_t_Cl)),sep=""))
+                       
+                       training_All = pamr.train(data_All, threshold = 0)
+                       valid_All = pamr.cv(training_All, data_All)
+                       valid_prob_Best1 = as.data.frame(valid_All$prob)
+                       scores_Best1=valid_prob_Best1[,2]
+                       ROCR.simple_Best1 = list(predictions=scores_Best1, labels=tumorLabels_Cl)
+                       pred_Best1 = prediction(ROCR.simple_Best1$predictions, ROCR.simple_Best1$labels)
+                       perf_Best1 = performance(pred_Best1,"tpr","fpr")
+                       perfAUC_Best1 = performance(pred_Best1,"tpr","fpr", measure="auc")
+                       
+                       AUC_Col = as.data.frame(cbind(perfAUC_Best1@y.values))
+                       AUC_Col$Col = NA
+                       AUC_Col$Col[which(AUC_Col > 0.7)] = colorROC[1]
+                       AUC_Col$Col[which(AUC_Col > 0.8)] = colorROC[2]
+                       AUC_Col$Col[which(AUC_Col > 0.825)] = colorROC[3]
+                       AUC_Col$Col[which(AUC_Col > 0.85)] = colorROC[4]
+                       AUC_Col$Col[which(AUC_Col > 0.875)] = colorROC[5]
+                       AUC_Col$Col[which(AUC_Col > 0.9)] = colorROC[6]
+                       AUC_Col$Col[which(AUC_Col > 0.925)] = colorROC[7]
+                       AUC_Col$Col[which(AUC_Col > 0.95)] = colorROC[8]
+                       AUC_Col$Col[which(AUC_Col > 0.975)] = colorROC[9]
+                       plot(perf_Best1, col = AUC_Col$Col, xlim=c(0,1), ylim=c(0,1), lwd = 2)
+                       par(new=TRUE)
+                       
+                       list(CLgenes, valid_All$error, training_All$centroids, training_All$sd, valid_All, perfAUC_Best1@y.values)               
+                     })
+dev.off()
+par(new = FALSE)
+# Obtain centroids #
+centrList_Cl = sapply(1:length(Centr100_Cl),
+                      function(x){
+                        list(Centr100_Cl[[x]][[3]])
+                      })
+centrCL = Reduce("+", centrList_Cl)/length(Centr100_Cl)
+
+SDListCL = sapply(1:length(Centr100_Cl),
+                  function(x){
+                    list(Centr100_Cl[[x]][[4]])
+                  })
+
+CLSD = Reduce("+", SDListCL)/length(Centr100_Cl)
+
+error_Cl = sapply(1:length(Centr100_Cl),
+                  function(x){
+                    list(Centr100_Cl[[x]][[2]])
+                  })
+write.table(error_Cl, file="Error_rate_Classical_GeneExp.csv", sep=";")
+
+AUC_Cl = sapply(1:length(Centr100_Cl),
+                function(x){
+                  list(Centr100_Cl[[x]][[6]][[1]])
+                })
+write.table(AUC_Cl, file="AUC_Classical_GeneExp.csv", sep=";")
+
+# "Synthetic" Centroid #
+centrCL = cbind(centrCL, centrCL[,1]+0.0000001, centrCL[,2]+0.0000001, centrCL[,1]-0.0000001, centrCL[,2]-0.0000001) # Add more than one column to the centroid, and then we will add the SD manuAlly
+write.table(CLSD, file="Classical_SD_GeneExp.csv", sep=";")
+write.table(centrCL, file="Classical_centroids_GeneExp.csv", sep=";")
+
+# Figures #
+# Volcano Plot
+pdf("Volcano_Plot_Classical_GeneExp.pdf")
+plot(Zratio_Cl, -log10(qvalue_Cl), main = "Classical vs Control - Volcano", xlim=c(-4, 4), ylim=c(0,12), xlab="Zratio")
+points (Zratio_Cl[filter_combined_Cl & Zratio_Cl > 0],
+        -log10(qvalue_Cl[filter_combined_Cl & Zratio_Cl > 0]),
+        pch = 16, col = "red")
+points (Zratio_Cl[filter_combined_Cl & Zratio_Cl < 0],
+        -log10(qvalue_Cl[filter_combined_Cl & Zratio_Cl < 0]),
+        pch = 16, col = "blue")
+
+abline(v = Zratio_cutoff, col = "red", lwd = 3)
+abline(v = -Zratio_cutoff, col = "blue", lwd = 3)
+abline(h = -log10(qvalue_cutoff), col = "grey", lwd = 3)
+dev.off()
+
+# Heatmap All DEG #
+filtered_metadata_Cl$Color[filtered_metadata_Cl$Classical=="Classical"]="red"
+filtered_metadata_Cl$Color[filtered_metadata_Cl$Classical=="Control"] = "yellow"
+colv = as.dendrogram(hclust(as.dist(1-cor(t(as.matrix(filtered_clean_Cl))))))
+rowv = as.dendrogram(hclust(as.dist(1-cor(as.matrix(filtered_clean_Cl)))))
+
+pdf("Heatmap_All_DEG_Classical_GeneExp.pdf")
+heatmap.2(as.matrix(t(filtered_clean_Cl)), cexCol=0.7,
+          col = rev(redblue(256)), Rowv=rowv, Colv=colv, scale = "row", trace=NULL, tracecol=NULL, ColSideColors = filtered_metadata_Cl$Color)
+legend('topleft', legend = unique(tumorLabels_Cl), fill = unique(filtered_metadata_Cl$Color), border=T, title='Subtype')
+dev.off()
+
+colvDendr = hclust(as.dist(1-cor(as.matrix(t(filtered_clean_Cl)))))
+plot(colv)
+
+# Cut dendrogram and calculate percentage of "good calls" #
+clusterCL = cbind("Cluster" = cutree(colvDendr, k = 3))
+clusterCL_meta = merge(ClinAll, clusterCL, by.x = 1, by.y = 0)
+table(clusterCL_meta$Classical, clusterCL_meta$Cluster)
+
+clusterCL_meta$ClusterClass = NA
+clusterCL_meta$ClusterClass[which(clusterCL_meta$Cluster == 1 | clusterCL_meta$Cluster == 2)] = "Control"
+clusterCL_meta$ClusterClass[which(clusterCL_meta$Cluster == 3)] = "Classical"
+table(clusterCL_meta$Classical, clusterCL_meta$ClusterClass)
+
+success = table(clusterCL_meta$Classical, clusterCL_meta$ClusterClass)[1,1] +
+  table(clusterCL_meta$Classical, clusterCL_meta$ClusterClass)[2,2]
+
+score_CL_All = success/sum(table(clusterCL_meta$Classical, clusterCL_meta$ClusterClass))
+kappa_CL_ALL = cohen.kappa(x=cbind(clusterCL_meta$Classical,clusterCL_meta$ClusterClass))
+
+# Heatmap Panel #
+centrCL = read.table("Classical_centroids_GeneExp.csv", sep=";", row.names=1)
+filt_centr_Cl = filtered_clean_Cl[which(colnames(filtered_clean_Cl)%in%rownames(centrCL))]
+colv = as.dendrogram(hclust(as.dist(1-cor(t(as.matrix(filt_centr_Cl))))))
+rowv = as.dendrogram(hclust(as.dist(1-cor(as.matrix(filt_centr_Cl)))))
+
+pdf("Heatmap_5_Genes_Classical_GeneExp.pdf")
+heatmap.2(as.matrix(t(filt_centr_Cl)), cexCol=0.7,
+          col = rev(redblue(256)), Rowv=rowv, Colv=colv, scale = "row", trace=NULL, tracecol=NULL, ColSideColors = filtered_metadata_Cl$Color)
+legend('topleft', legend = unique(tumorLabels_Cl), fill = unique(filtered_metadata_Cl$Color), border=T, title='Subtype')
+dev.off()
+
+# Cut dendrogram and calculate percentage of "good calls" #
+colvDendr = hclust(as.dist(1-cor(as.matrix(t(filt_centr_Cl)))))
+plot(colv)
+
+dend1 <- color_labels(colvDendr, k = 3)
+plot(dend1, main = "default cuts by cutree")
+
+clusterCL = cbind("Cluster" = cutree(colvDendr, k = 3))
+clusterCL_meta = merge(ClinAll, clusterCL, by.x = 1, by.y = 0)
+table(clusterCL_meta$Classical, clusterCL_meta$Cluster)
+
+clusterCL_meta$ClusterClass = NA
+clusterCL_meta$ClusterClass[which(clusterCL_meta$Cluster == 1 | clusterCL_meta$Cluster == 2)] = "Control"
+clusterCL_meta$ClusterClass[which(clusterCL_meta$Cluster == 3)] = "Classical"
+table(clusterCL_meta$Classical, clusterCL_meta$ClusterClass)
+
+success = table(clusterCL_meta$Classical, clusterCL_meta$ClusterClass)[1,1] +
+  table(clusterCL_meta$Classical, clusterCL_meta$ClusterClass)[2,2]
+
+score_CL_Panel = success/sum(table(clusterCL_meta$Classical, clusterCL_meta$ClusterClass))
+kappa_CL_Panel = cohen.kappa(x=cbind(clusterCL_meta$Classical,clusterCL_meta$ClusterClass))
+scoreCL = cbind("Score All" = score_CL_All, "Score Panel" = score_CL_Panel, "Kappa All" = kappa_CL_ALL$kappa, "Kappa Panel" = kappa_CL_Panel$kappa)
+
+write.table(scoreCL, file = "Score_hierarchical_clustering_Classical_GeneExp.csv", sep = ";")
+
+# t-SNE All DEG #
+Tsne = Rtsne(as.matrix(filtered_clean_Cl),perplexity = 30, theta = 0, max_iter = 5000)
+
+pdf('tSNE_Classical_All_DEG.pdf')
+plot(Tsne$Y, main="t-SNE Classical vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Cl], pch=19)
+legend('topleft', legend = unique(tumorLabels_Cl), fill=plottingColors[unique(tumorLabels_Cl)], border=T, title='Subtype')
+dev.off()
+
+# t-SNE Panel #
+Tsne = Rtsne(as.matrix(filt_centr_Cl),perplexity = 30, theta = 0, max_iter = 5000)
+
+pdf('tSNE_5_genes_Classical.pdf')
+plot(Tsne$Y, main="t-SNE Classical vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Cl], pch=19)
+legend('topleft', legend = unique(tumorLabels_Cl), fill=plottingColors[unique(tumorLabels_Cl)], border=T, title='Subtype')
+dev.off()
+
+#### MESENCHYMAL ####
+Clin_me = ClinAll[which(ClinAll$Mesenchymal == "Mesenchymal"),]
+Clin_cont = ClinAll[which(ClinAll$Classical == "Control"),]
+barcodeME = Clin_me$Patient.ID
+barcodeCont = Clin_cont$Patient.ID
+
+Gene_Me = GBM[which(rownames(GBM) %in% barcodeME),]
+Gene_Me_t = as.data.frame(as.matrix(t(Gene_Me)))
+
+Gene_Cont = GBM[which(!rownames(GBM) %in% barcodeME),]
+Gene_Cont_t = as.data.frame(as.matrix(t(Gene_Cont)))
+
+ME.mean = apply(Gene_Me_t, 1, mean)
+CONTR.mean = apply(Gene_Cont_t,1, mean)
+
+fold_Me = (ME.mean-CONTR.mean)
+Zratio_Me = (fold_Me/sd(fold_Me))
+
+# Compute statistical significance #
+pvalue_Me = NULL
+tstat_Me = NULL
+for(i in 1 : nrow(Gene_Me_t)) {
+  x = Gene_Me_t[i,]
+  y = Gene_Cont_t[i,]
+  
+  t = t.test(x, y) 
+  pvalue_Me[i] = t$p.value
+  tstat_Me[i] = t$statistic
+}
+
+qvalue_Me = p.adjust(pvalue_Me, method = "fdr", n = length(pvalue_Me)) # Correction by False Discovery Rate
+combined_Me = cbind(qvalue_Me, Zratio_Me, abs(Zratio_Me), GBM_t)
+
+# Filter per Z-Ratio and qvalue #
+Zratio_cutoff = 1.5
+qvalue_cutoff = 0.05
+
+# Zratio-change filter for "biological" significance
+filter_by_Zratio_Me = abs(Zratio_Me) >= Zratio_cutoff
+dim(GBM_t[filter_by_Zratio_Me, ]) 
+
+# P-value filter for "statistical" significance
+filter_by_qvalue_Me = qvalue_Me <= qvalue_cutoff
+dim(GBM_t[filter_by_qvalue_Me, ]) 
+
+# Combined filter (both biological and statistical)
+filter_combined_Me = filter_by_Zratio_Me & filter_by_qvalue_Me 
+
+filtered_Me = GBM_t[filter_combined_Me,]
+dim(filtered_Me)
+filtered_combined_Me = merge(combined_Me, filtered_Me, by=0)
+genes_with_changes_Me = filtered_combined_Me[,1:4]
+UpGenes_Me = genes_with_changes_Me$Row.names[which(genes_with_changes_Me$Zratio>0)]
+DownGenes_Me = genes_with_changes_Me$Row.names[which(genes_with_changes_Me$Zratio<0)]
+write.table(genes_with_changes_Me, file = "DEG_Mesenchymal.csv", sep = ";")
+
+# Create dataframe with Subtype data #
+tumorMetadata_Me = cbind("Patient.ID" = as.character(ClinAll$Patient.ID), "Mesenchymal" = as.character(ClinAll$Mesenchymal))
+filtered_t_Me = as.data.frame(as.matrix(t(filtered_Me)))
+filtered_metadata_Me = merge(tumorMetadata_Me, filtered_t_Me, by.x=1, by.y=0)
+rownames(filtered_metadata_Me) = filtered_metadata_Me[,1]
+names(filtered_metadata_Me) = c(as.character(colnames(tumorMetadata_Me)), as.character(colnames(filtered_t_Me)))
+tumorLabels_Me = as.character(filtered_metadata_Me$Mesenchymal)
+plottingColors = c("Red", "cadetblue")
+names(plottingColors) = unique(tumorLabels_Me)
+
+filtered_metadata_t_Me = as.data.frame(as.matrix(t(filtered_metadata_Me)))
+filtered_clean_Me = filtered_metadata_Me[,-c(1,2)]
+filtered_clean_t_Me = as.data.frame(as.matrix(t(filtered_clean_Me)))
+
+# Use Random Forest and Nearest Shrunken Centroid to select the features for the panel #
+Me_Genes = lapply(1:300,
+                  function(x){
+                    
+                    # Random Forest #
+                    RF_Me = varSelRF(filtered_clean_Me, as.factor(tumorLabels_Me), c.sd = 2, mtryFactor = 1, ntree = 1000,
+                                     ntreeIterat = 500, vars.drop.num = NULL, vars.drop.frac = 0.2,
+                                     whole.range = TRUE, recompute.var.imp = TRUE, verbose = FALSE,
+                                     returnFirstForest = FALSE, fitted.rf = NULL, keep.forest = FALSE)
+                    
+                    sel_hist = RF_Me$selec.history
+                    sel_hist=sel_hist[order(sel_hist$Number.Variables),]
+                    sel_hist=sel_hist[order(sel_hist$OOB),]
+                    sel_hist2=data.frame(x = sel_hist$Vars.in.Forest)
+                    All_variables = sel_hist2 %>% separate(x, as.character(1:ncol(filtered_clean_Me)))
+                    sel_genes = na.omit(as.factor(All_variables[1,]))
+                    sel_genes = droplevels.factor(sel_genes)
+                    RF_genes = as.vector(sel_genes)
+                    
+                    # Nearest Shrunken Centroid #
+                    filt100_t = filtered_clean_t_Me[which(rownames(filtered_clean_t_Me) %in% RF_genes),]
+                    filt100 = as.data.frame(as.matrix(t(filt100_t)))
+                    subsetCentroid = as.data.frame(as.matrix(t(filt100)))
+                    
+                    data_All = list(x = as.matrix(subsetCentroid), y = as.vector(tumorLabels_Me), 
+                                    geneid = rownames(subsetCentroid),
+                                    genenames = paste("g",as.character(1:nrow(subsetCentroid)),sep=""))
+                    
+                    training_All = pamr.train(data_All)
+                    valid_All = pamr.cv(training_All, data_All)
+                    valid_All
+                    Genes1 = pamr.listgenes(training_All, data_All, threshold = 0.5, fitcv=valid_All)
+                    Genes1Up = Genes1[,1][which(Genes1[,2]>0)]
+                    Genes1Down = Genes1[,1][which(Genes1[,2]<0)]
+                    selected_genes = c(Genes1Up[1:2], Genes1Down[1:2], as.character(Genes1[,1]))
+                    selected_genes = unique(selected_genes)[1:5]
+                    
+                    print(x)
+                    
+                    selected_genes
+                  })
+
+
+Me_Genes_Sorted = lapply(1:300,
+                         function(k){
+                           sort(Me_Genes[[k]])
+                         })  
+
+# Select the most repeated combination #
+n.obs = sapply(Me_Genes_Sorted, length)
+seq.max = seq_len(max(n.obs))
+ClComb = as.data.frame(t(sapply(Me_Genes_Sorted, "[", i = seq.max)))
+
+get_perm = function(v) {
+  m = permutations(n = length(v), r = length(v), v = v, set = F)
+  m[order(c(m))]
+}
+All = map(Me_Genes_Sorted, get_perm)
+unique = map(Me_Genes_Sorted, get_perm) %>% unique()
+res_vec = c()
+element = c()
+
+for(i in seq_along(unique)) {
+  element[[i]] = unique[[i]] %>% unique() %>% paste(collapse = ",")
+  res_vec[[i]] = All %in% unique[i] %>% sum()
+}
+
+repetitions_Me=tibble(
+  elements = unlist(element),
+  numbers = res_vec
+)
+
+repeat1_Me = repetitions_Me[order(-as.numeric(repetitions_Me$numbers)),]
+MEgenes = strsplit(as.character(repeat1_Me[1,1]), ",")
+MEgenes = MEgenes[[1]]
+
+# Create centroids in groups of 50 patients #
+colorROC = rep(brewer.pal(n = 9, name = "YlOrRd"), 17)
+pdf("ROC_Mesenchymal_GeneExp.pdf")
+Centr100_Me = lapply(1:300,
+                     function(x){
+                       Clin_cl_t = as.data.frame(as.matrix(t(Clin_cl)))
+                       Clin_cl30 = as.data.frame(as.matrix(t(sample(Clin_cl_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin_me_t = as.data.frame(as.matrix(t(Clin_me)))
+                       Clin_me30 = as.data.frame(as.matrix(t(sample(Clin_me_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin_pn_t = as.data.frame(as.matrix(t(Clin_pn)))
+                       Clin_pn30 = as.data.frame(as.matrix(t(sample(Clin_pn_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin = rbind(Clin_cl30, Clin_me30, Clin_pn30)
+                       
+                       GBM90 = GBMAll[which(rownames(GBMAll) %in% Clin$Patient.ID),]
+                       GBM = scale(GBM90)
+                       GBM_t = as.data.frame(as.matrix(t(GBM)))
+                       barcode = rownames(GBM)
+                       
+                       tumorMetadata_Me = cbind("Patient.ID" = as.character(Clin$Patient.ID), "Mesenchymal" = as.character(Clin$Mesenchymal))
+                       filtered_t_Me = GBM[,which(colnames(GBM)%in%MEgenes)]
+                       filtered_metadata_Me = merge(tumorMetadata_Me, filtered_t_Me, by.x=1, by.y=0)
+                       names(filtered_metadata_Me) = c(as.character(colnames(tumorMetadata_Me)), as.character(colnames(filtered_t_Me)))
+                       tumorLabels_Me = as.character(filtered_metadata_Me$Mesenchymal)
+                       plottingColors = c("Red", "cadetblue")
+                       names(plottingColors) = unique(tumorLabels_Me)
+                       
+                       filtered_metadata_t_Me = as.data.frame(as.matrix(t(filtered_metadata_Me)))
+                       filtered_clean_Me = filtered_metadata_Me[,-c(1,2)]
+                       filtered_clean_t_Me = as.data.frame(as.matrix(t(filtered_clean_Me)))
+                       
+                       
+                       data_All = list(x = as.matrix(filtered_clean_t_Me), y = as.vector(tumorLabels_Me), 
+                                       geneid = rownames(filtered_clean_t_Me),
+                                       genenames = paste("g",as.character(1:nrow(filtered_clean_t_Me)),sep=""))
+                       
+                       training_All = pamr.train(data_All, threshold = 0)
+                       valid_All = pamr.cv(training_All, data_All)
+                       valid_prob_Best1 = as.data.frame(valid_All$prob)
+                       scores_Best1=valid_prob_Best1[,2]
+                       ROCR.simple_Best1 = list(predictions=scores_Best1, labels=tumorLabels_Me)
+                       pred_Best1 = prediction(ROCR.simple_Best1$predictions, ROCR.simple_Best1$labels)
+                       perf_Best1 = performance(pred_Best1,"tpr","fpr")
+                       perfAUC_Best1 = performance(pred_Best1,"tpr","fpr", measure="auc")
+                       
+                       AUC_Col = as.data.frame(cbind(perfAUC_Best1@y.values))
+                       AUC_Col$Col = NA
+                       AUC_Col$Col[which(AUC_Col > 0.7)] = colorROC[1]
+                       AUC_Col$Col[which(AUC_Col > 0.8)] = colorROC[2]
+                       AUC_Col$Col[which(AUC_Col > 0.825)] = colorROC[3]
+                       AUC_Col$Col[which(AUC_Col > 0.85)] = colorROC[4]
+                       AUC_Col$Col[which(AUC_Col > 0.875)] = colorROC[5]
+                       AUC_Col$Col[which(AUC_Col > 0.9)] = colorROC[6]
+                       AUC_Col$Col[which(AUC_Col > 0.925)] = colorROC[7]
+                       AUC_Col$Col[which(AUC_Col > 0.95)] = colorROC[8]
+                       AUC_Col$Col[which(AUC_Col > 0.975)] = colorROC[9]
+                       plot(perf_Best1, col = AUC_Col$Col, xlim=c(0,1), ylim=c(0,1), lwd = 2)
+                       par(new=TRUE)
+                       
+                       list(MEgenes, valid_All$error, training_All$centroids, training_All$sd, valid_All, perfAUC_Best1@y.values)               
+                     })
+dev.off()
+par(new = FALSE)
+
+# Obtain centroids #
+centrList_Me = sapply(1:length(Centr100_Me),
+                      function(x){
+                        list(Centr100_Me[[x]][[3]])
+                      })
+centrME = Reduce("+", centrList_Me)/length(Centr100_Me)
+
+SDListME = sapply(1:length(Centr100_Me),
+                  function(x){
+                    list(Centr100_Me[[x]][[4]])
+                  })
+
+MESD = Reduce("+", SDListME)/length(Centr100_Me)
+
+error_Me = sapply(1:length(Centr100_Me),
+                  function(x){
+                    list(Centr100_Me[[x]][[2]])
+                  })
+write.table(error_Me, file="Error_rate_Mesenchymal_GeneExp.csv", sep=";")
+
+AUC_Me = sapply(1:length(Centr100_Me),
+                function(x){
+                  list(Centr100_Me[[x]][[6]][[1]])
+                })
+write.table(AUC_Me, file="AUC_Mesenchymal_GeneExp.csv", sep=";")
+
+# "Synthetic" Centroid #
+centrME = cbind(centrME, centrME[,1]+0.0000001, centrME[,2]+0.0000001, centrME[,1]-0.0000001, centrME[,2]-0.0000001) # Add more than one column to the centroid, and then we will add the SD manuAlly
+write.table(MESD, file="Mesenchymal_SD_GeneExp.csv", sep=";")
+write.table(centrME, file="Mesenchymal_centroids_GeneExp.csv", sep=";")
+
+# Figures #
+# Volcano Plot #
+pdf("Volcano_Plot_Mesenchymal_GeneExp.pdf")
+plot(Zratio_Me, -log10(qvalue_Me), main = "Mesenchymal vs Control - Volcano", xlim=c(-4, 4), ylim=c(0,12), xlab="Zratio")
+points (Zratio_Me[filter_combined_Me & Zratio_Me > 0],
+        -log10(qvalue_Me[filter_combined_Me & Zratio_Me > 0]),
+        pch = 16, col = "red")
+points (Zratio_Me[filter_combined_Me & Zratio_Me < 0],
+        -log10(qvalue_Me[filter_combined_Me & Zratio_Me < 0]),
+        pch = 16, col = "blue")
+
+abline(v = Zratio_cutoff, col = "red", lwd = 3)
+abline(v = -Zratio_cutoff, col = "blue", lwd = 3)
+abline(h = -log10(qvalue_cutoff), col = "grey", lwd = 3)
+dev.off()
+
+# Heatmap All DEG #
+filtered_metadata_Me$Color[filtered_metadata_Me$Mesenchymal=="Mesenchymal"]="red"
+filtered_metadata_Me$Color[filtered_metadata_Me$Mesenchymal=="Control"] = "yellow"
+colv = as.dendrogram(hclust(as.dist(1-cor(t(as.matrix(filtered_clean_Me))))))
+rowv = as.dendrogram(hclust(as.dist(1-cor(as.matrix(filtered_clean_Me)))))
+
+pdf("Heatmap_All_DEG_Mesenchymal_GeneExp.pdf")
+heatmap.2(as.matrix(t(filtered_clean_Me)), cexCol=0.7,
+          col = rev(redblue(256)), Rowv=rowv, Colv=colv, scale = "row", trace=NULL, tracecol=NULL, ColSideColors = filtered_metadata_Me$Color)
+legend('topleft', legend = unique(tumorLabels_Me), fill = unique(filtered_metadata_Me$Color), border=T, title='Subtype')
+dev.off()
+
+# Cut dendrogram and calculate percentage of "good calls" #
+colvDendr = hclust(as.dist(1-cor(as.matrix(t(filtered_clean_Me)))))
+plot(colv)
+dend1 <- color_labels(colvDendr, k = 3)
+plot(dend1, main = "default cuts by cutree")
+
+clusterME = cbind("Cluster" = cutree(colvDendr, k = 2))
+clusterME_meta = merge(ClinAll, clusterME, by.x = 1, by.y = 0)
+table(clusterME_meta$Mesenchymal, clusterME_meta$Cluster)
+
+clusterME_meta$clusterClass = NA
+clusterME_meta$clusterClass[which(clusterME_meta$Cluster == 1)] = "Control"
+clusterME_meta$clusterClass[which(!clusterME_meta$Cluster == 1)] = "Mesenchymal"
+table(clusterME_meta$Mesenchymal, clusterME_meta$clusterClass)
+
+success = table(clusterME_meta$Mesenchymal, clusterME_meta$clusterClass)[1,1] +
+  table(clusterME_meta$Mesenchymal, clusterME_meta$clusterClass)[2,2]
+
+score_ME_All = success/sum(table(clusterME_meta$Mesenchymal, clusterME_meta$clusterClass))
+kappa_ME_All = cohen.kappa(x=cbind(clusterME_meta$Mesenchymal,clusterME_meta$clusterClass))
+
+# Heatmap Panel #
+centrME = read.table("Mesenchymal_centroids_GeneExp.csv", sep=";", row.names=1)
+filt_centr_Me = filtered_clean_Me[which(colnames(filtered_clean_Me)%in%rownames(centrME))]
+colv = as.dendrogram(hclust(as.dist(1-cor(t(as.matrix(filt_centr_Me))))))
+rowv = as.dendrogram(hclust(as.dist(1-cor(as.matrix(filt_centr_Me)))))
+
+pdf("Heatmap_5_Genes_Mesenchymal_GeneExp.pdf")
+heatmap.2(as.matrix(t(filt_centr_Me)), cexCol=0.7,
+          col = rev(redblue(256)), Rowv=rowv, Colv=colv, scale = "row", trace=NULL, tracecol=NULL, ColSideColors = filtered_metadata_Me$Color)
+legend('topleft', legend = unique(tumorLabels_Me), fill = unique(filtered_metadata_Me$Color), border=T, title='Subtype')
+dev.off()
+
+# Cut dendrogram and calculate percentage of "good calls" #
+colvDendr = hclust(as.dist(1-cor(as.matrix(t(filt_centr_Me)))))
+plot(colv)
+dend1 <- color_labels(colvDendr, k = 2)
+plot(dend1, main = "default cuts by cutree")
+
+clusterME = cbind("Cluster" = cutree(colvDendr, k = 2))
+clusterME_meta = merge(ClinAll, clusterME, by.x = 1, by.y = 0)
+table(clusterME_meta$Mesenchymal, clusterME_meta$Cluster)
+
+clusterME_meta$clusterClass = NA
+clusterME_meta$clusterClass[which(clusterME_meta$Cluster == 2)] = "Control"
+clusterME_meta$clusterClass[which(clusterME_meta$Cluster == 1)] = "Mesenchymal"
+table(clusterME_meta$Mesenchymal, clusterME_meta$clusterClass)
+
+success = table(clusterME_meta$Mesenchymal, clusterME_meta$clusterClass)[1,1] +
+  table(clusterME_meta$Mesenchymal, clusterME_meta$clusterClass)[2,2]
+
+score_ME_Panel = success/sum(table(clusterME_meta$Mesenchymal, clusterME_meta$clusterClass))
+kappa_ME_Panel = cohen.kappa(x=cbind(clusterME_meta$Mesenchymal,clusterME_meta$clusterClass))
+scoreME = cbind("Score All" = score_ME_All, "Score Panel" = score_ME_Panel, "Kappa All" = kappa_ME_All$kappa, "Kappa Panel" = kappa_ME_Panel$kappa)
+
+write.table(scoreME, file = "Score_hierarchical_clustering_Mesenchymal_GeneExp.csv", sep = ";")
+
+# t-SNE All DEG #
+Tsne = Rtsne(as.matrix(filtered_clean_Me),perplexity = 30, theta = 0, max_iter = 5000)
+
+pdf('tSNE_Mesenchymal_All_DEG.pdf')
+plot(Tsne$Y, main="t-SNE Mesenchymal vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Me], pch=19)
+legend('topleft', legend = unique(tumorLabels_Me), fill=plottingColors[unique(tumorLabels_Me)], border=T, title='Subtype')
+dev.off()
+
+# t-SNE Panel #
+Tsne = Rtsne(as.matrix(filt_centr_Me),perplexity = 30, theta = 0, max_iter = 5000)
+
+pdf('tSNE_5_genes_Mesenchymal.pdf')
+plot(Tsne$Y, main="t-SNE Mesenchymal vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Me], pch=19)
+legend('topleft', legend = unique(tumorLabels_Me), fill=plottingColors[unique(tumorLabels_Me)], border=T, title='Subtype')
+dev.off()
+
+
+#### PRONEURAL ####
+Clin_pn = ClinAll[which(ClinAll$Proneural == "Proneural"),]
+Clin_cont = ClinAll[which(ClinAll$Proneural == "Control"),]
+barcodeME = Clin_pn$Patient.ID
+barcodeCont = Clin_cont$Patient.ID
+
+Gene_Pn = GBM[which(rownames(GBM) %in% barcodeME),]
+Gene_Pn_t = as.data.frame(as.matrix(t(Gene_Pn)))
+
+Gene_Cont = GBM[which(!rownames(GBM) %in% barcodeME),]
+Gene_Cont_t = as.data.frame(as.matrix(t(Gene_Cont)))
+
+PN.mean = apply(Gene_Pn_t, 1, mean)
+CONTR.mean = apply(Gene_Cont_t,1, mean)
+
+fold_Pn = (PN.mean-CONTR.mean)
+Zratio_Pn = (fold_Pn/sd(fold_Pn))
+
+# Compute statistical significance #
+pvalue_Pn = NULL
+tstat_Pn = NULL
+for(i in 1 : nrow(Gene_Pn_t)) {
+  x = Gene_Pn_t[i,]
+  y = Gene_Cont_t[i,]
+  
+  t = t.test(x, y) 
+  pvalue_Pn[i] = t$p.value
+  tstat_Pn[i] = t$statistic
+}
+
+qvalue_Pn = p.adjust(pvalue_Pn, method = "fdr", n = length(pvalue_Pn)) # Correction by False Discovery Rate
+combined_Pn = cbind(qvalue_Pn, Zratio_Pn, abs(Zratio_Pn), GBM_t)
+
+# Filter per Z-Ratio and qvalue #
+Zratio_cutoff = 1.5
+qvalue_cutoff = 0.05
+
+# Zratio-change filter for "biological" significance
+filter_by_Zratio_Pn = abs(Zratio_Pn) >= Zratio_cutoff
+dim(GBM_t[filter_by_Zratio_Pn, ]) 
+
+# P-value filter for "statistical" significance
+filter_by_qvalue_Pn = qvalue_Pn <= qvalue_cutoff
+dim(GBM_t[filter_by_qvalue_Pn, ]) 
+
+# Combined filter (both biological and statistical)
+filter_combined_Pn = filter_by_Zratio_Pn & filter_by_qvalue_Pn 
+
+filtered_Pn = GBM_t[filter_combined_Pn,]
+dim(filtered_Pn)
+filtered_combined_Pn = merge(combined_Pn, filtered_Pn, by=0)
+genes_with_changes_Pn = filtered_combined_Pn[,1:4]
+UpGenes_Pn = genes_with_changes_Pn$Row.names[which(genes_with_changes_Pn$Zratio>0)]
+DownGenes_Pn = genes_with_changes_Pn$Row.names[which(genes_with_changes_Pn$Zratio<0)]
+write.table(genes_with_changes_Pn, file = "DEG_Proneural.csv", sep = ";")
+
+# Create dataframe with Subtype data #
+tumorMetadata_Pn = cbind("Patient.ID" = as.character(ClinAll$Patient.ID), "Proneural" = as.character(ClinAll$Proneural))
+filtered_t_Pn = as.data.frame(as.matrix(t(filtered_Pn)))
+filtered_metadata_Pn = merge(tumorMetadata_Pn, filtered_t_Pn, by.x=1, by.y=0)
+rownames(filtered_metadata_Pn) = filtered_metadata_Pn[,1]
+names(filtered_metadata_Pn) = c(as.character(colnames(tumorMetadata_Pn)), as.character(colnames(filtered_t_Pn)))
+tumorLabels_Pn = as.character(filtered_metadata_Pn$Proneural)
+plottingColors = c("Red", "cadetblue")
+names(plottingColors) = unique(tumorLabels_Pn)
+
+filtered_metadata_t_Pn = as.data.frame(as.matrix(t(filtered_metadata_Pn)))
+filtered_clean_Pn = filtered_metadata_Pn[,-c(1,2)]
+filtered_clean_t_Pn = as.data.frame(as.matrix(t(filtered_clean_Pn)))
+
+
+# Use Random Forest and Nearest Shrunken Centroid to select the features for the panel #
+Pn_Genes = lapply(1:300,
+                  function(x){
+                    
+                    # Random Forest #
+                    RF_Pn = varSelRF(filtered_clean_Pn, as.factor(tumorLabels_Pn), c.sd = 2, mtryFactor = 1, ntree = 1000,
+                                     ntreeIterat = 500, vars.drop.num = NULL, vars.drop.frac = 0.2,
+                                     whole.range = TRUE, recompute.var.imp = TRUE, verbose = FALSE,
+                                     returnFirstForest = FALSE, fitted.rf = NULL, keep.forest = FALSE)
+                    
+                    sel_hist = RF_Pn$selec.history
+                    sel_hist=sel_hist[order(sel_hist$Number.Variables),]
+                    sel_hist=sel_hist[order(sel_hist$OOB),]
+                    sel_hist2=data.frame(x = sel_hist$Vars.in.Forest)
+                    All_variables = sel_hist2 %>% separate(x, as.character(1:ncol(filtered_clean_Pn)))
+                    sel_genes = na.omit(as.factor(All_variables[1,]))
+                    sel_genes = droplevels.factor(sel_genes)
+                    RF_genes = as.vector(sel_genes)
+                    
+                    # Nearest Shrunken Centroid #
+                    filt100_t = filtered_clean_t_Pn[which(rownames(filtered_clean_t_Pn) %in% RF_genes),]
+                    filt100 = as.data.frame(as.matrix(t(filt100_t)))
+                    subsetCentroid = as.data.frame(as.matrix(t(filt100)))
+                    
+                    data_All = list(x = as.matrix(subsetCentroid), y = as.vector(tumorLabels_Pn), 
+                                    geneid = rownames(subsetCentroid),
+                                    genenames = paste("g",as.character(1:nrow(subsetCentroid)),sep=""))
+                    
+                    training_All = pamr.train(data_All)
+                    valid_All = pamr.cv(training_All, data_All)
+                    valid_All
+                    Genes1 = pamr.listgenes(training_All, data_All, threshold = 0.5, fitcv=valid_All)
+                    Genes1Up = Genes1[,1][which(Genes1[,2]>0)]
+                    Genes1Down = Genes1[,1][which(Genes1[,2]<0)]
+                    selected_genes = c(Genes1Up[1:2], Genes1Down[1:2], as.character(Genes1[,1]))
+                    selected_genes = unique(selected_genes)[1:5]
+                    
+                    print(x)
+                    
+                    selected_genes
+                  })
+
+
+Pn_Genes_Sorted = lapply(1:300,
+                         function(k){
+                           sort(Pn_Genes[[k]])
+                         })  
+
+# Select the most repeated combination #
+n.obs = sapply(Pn_Genes_Sorted, length)
+seq.max = seq_len(max(n.obs))
+ClComb = as.data.frame(t(sapply(Pn_Genes_Sorted, "[", i = seq.max)))
+
+get_perm = function(v) {
+  m = permutations(n = length(v), r = length(v), v = v, set = F)
+  m[order(c(m))]
+}
+All = map(Pn_Genes_Sorted, get_perm)
+unique = map(Pn_Genes_Sorted, get_perm) %>% unique()
+res_vec = c()
+element = c()
+
+for(i in seq_along(unique)) {
+  element[[i]] = unique[[i]] %>% unique() %>% paste(collapse = ",")
+  res_vec[[i]] = All %in% unique[i] %>% sum()
+}
+
+repetitions_Pn = tibble(
+  elements = unlist(element),
+  numbers = res_vec
+)
+
+repeat1_Pn = repetitions_Pn[order(-as.numeric(repetitions_Pn$numbers)),]
+PNgenes = strsplit(as.character(repeat1_Pn[1,1]), ",")
+PNgenes = PNgenes[[1]]
+
+# Create centroids in groups of 50 patients #
+colorROC = rep(brewer.pal(n = 9, name = "YlOrRd"), 17)
+pdf("ROC_Proneural_GeneExp.pdf")
+Centr100_Pn = lapply(1:300,
+                     function(x){
+                       Clin_cl_t = as.data.frame(as.matrix(t(Clin_cl)))
+                       Clin_cl30 = as.data.frame(as.matrix(t(sample(Clin_cl_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin_me_t = as.data.frame(as.matrix(t(Clin_me)))
+                       Clin_me30 = as.data.frame(as.matrix(t(sample(Clin_me_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin_pn_t = as.data.frame(as.matrix(t(Clin_pn)))
+                       Clin_pn30 = as.data.frame(as.matrix(t(sample(Clin_pn_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin = rbind(Clin_cl30, Clin_me30, Clin_pn30)
+                       
+                       GBM90 = GBMAll[which(rownames(GBMAll) %in% Clin$Patient.ID),]
+                       GBM = scale(GBM90)
+                       GBM_t = as.data.frame(as.matrix(t(GBM)))
+                       barcode = rownames(GBM)
+                       
+                       tumorMetadata_Pn = cbind("Patient.ID" = as.character(Clin$Patient.ID), "Proneural" = as.character(Clin$Proneural))
+                       filtered_t_Pn = GBM[,which(colnames(GBM)%in%PNgenes)]
+                       filtered_metadata_Pn = merge(tumorMetadata_Pn, filtered_t_Pn, by.x=1, by.y=0)
+                       names(filtered_metadata_Pn) = c(as.character(colnames(tumorMetadata_Pn)), as.character(colnames(filtered_t_Pn)))
+                       tumorLabels_Pn = as.character(filtered_metadata_Pn$Proneural)
+                       plottingColors = c("Red", "cadetblue")
+                       names(plottingColors) = unique(tumorLabels_Pn)
+                       
+                       filtered_metadata_t_Pn = as.data.frame(as.matrix(t(filtered_metadata_Pn)))
+                       filtered_clean_Pn = filtered_metadata_Pn[,-c(1,2)]
+                       filtered_clean_t_Pn = as.data.frame(as.matrix(t(filtered_clean_Pn)))
+                       
+                       data_All = list(x = as.matrix(filtered_clean_t_Pn), y = as.vector(tumorLabels_Pn), 
+                                       geneid = rownames(filtered_clean_t_Pn),
+                                       genenames = paste("g",as.character(1:nrow(filtered_clean_t_Pn)),sep=""))
+                       
+                       training_All = pamr.train(data_All, threshold = 0)
+                       valid_All = pamr.cv(training_All, data_All)
+                       valid_prob_Best1 = as.data.frame(valid_All$prob)
+                       scores_Best1=valid_prob_Best1[,2]
+                       ROCR.simple_Best1 = list(predictions=scores_Best1, labels=tumorLabels_Pn)
+                       pred_Best1 = prediction(ROCR.simple_Best1$predictions, ROCR.simple_Best1$labels)
+                       perf_Best1 = performance(pred_Best1,"tpr","fpr")
+                       perfAUC_Best1 = performance(pred_Best1,"tpr","fpr", measure="auc")
+                       
+                       AUC_Col = as.data.frame(cbind(perfAUC_Best1@y.values))
+                       AUC_Col$Col = NA
+                       AUC_Col$Col[which(AUC_Col > 0.7)] = colorROC[1]
+                       AUC_Col$Col[which(AUC_Col > 0.8)] = colorROC[2]
+                       AUC_Col$Col[which(AUC_Col > 0.825)] = colorROC[3]
+                       AUC_Col$Col[which(AUC_Col > 0.85)] = colorROC[4]
+                       AUC_Col$Col[which(AUC_Col > 0.875)] = colorROC[5]
+                       AUC_Col$Col[which(AUC_Col > 0.9)] = colorROC[6]
+                       AUC_Col$Col[which(AUC_Col > 0.925)] = colorROC[7]
+                       AUC_Col$Col[which(AUC_Col > 0.95)] = colorROC[8]
+                       AUC_Col$Col[which(AUC_Col > 0.975)] = colorROC[9]
+                       plot(perf_Best1, col = AUC_Col$Col, xlim=c(0,1), ylim=c(0,1), lwd = 2)
+                       par(new=TRUE)
+                       
+                       list(PNgenes, valid_All$error, training_All$centroids, training_All$sd, valid_All, perfAUC_Best1@y.values)               
+                     })
+dev.off()
+par(new = FALSE)
+# Obtain centroids #
+centrList_Pn = sapply(1:length(Centr100_Pn),
+                      function(x){
+                        list(Centr100_Pn[[x]][[3]])
+                      })
+centrPN = Reduce("+", centrList_Pn)/length(Centr100_Pn)
+
+SDListPN = sapply(1:length(Centr100_Pn),
+                  function(x){
+                    list(Centr100_Pn[[x]][[4]])
+                  })
+
+PNSD = Reduce("+", SDListPN)/length(Centr100_Pn)
+
+error_Pn = sapply(1:length(Centr100_Pn),
+                  function(x){
+                    list(Centr100_Pn[[x]][[2]])
+                  })
+write.table(error_Pn, file="Error_rate_Proneural_GeneExp.csv", sep=";")
+
+AUC_Pn = sapply(1:length(Centr100_Pn),
+                function(x){
+                  list(Centr100_Pn[[x]][[6]][[1]])
+                })
+write.table(AUC_Pn, file="AUC_Proneural_GeneExp.csv", sep=";")
+
+# "Synthetic" Centroid #
+centrPN = cbind(centrPN, centrPN[,1]+0.0000001, centrPN[,2]+0.0000001, centrPN[,1]-0.0000001, centrPN[,2]-0.0000001) # Add more than one column to the centroid, and then we will add the SD manuAlly
+write.table(PNSD, file="Proneural_SD_GeneExp.csv", sep=";")
+write.table(centrPN, file="Proneural_centroids_GeneExp.csv", sep=";")
+
+# Figures #
+# Volcano Plot #
+pdf("Volcano_Plot_Proneural_GeneExp.pdf")
+plot(Zratio_Pn, -log10(qvalue_Pn), main = "Proneural vs Control - Volcano", xlim=c(-4, 4), ylim=c(0,12), xlab="Zratio")
+points (Zratio_Pn[filter_combined_Pn & Zratio_Pn > 0],
+        -log10(qvalue_Pn[filter_combined_Pn & Zratio_Pn > 0]),
+        pch = 16, col = "red")
+points (Zratio_Pn[filter_combined_Pn & Zratio_Pn < 0],
+        -log10(qvalue_Pn[filter_combined_Pn & Zratio_Pn < 0]),
+        pch = 16, col = "blue")
+
+abline(v = Zratio_cutoff, col = "red", lwd = 3)
+abline(v = -Zratio_cutoff, col = "blue", lwd = 3)
+abline(h = -log10(qvalue_cutoff), col = "grey", lwd = 3)
+dev.off()
+
+# Heatmap All DEG #
+filtered_metadata_Pn$Color[filtered_metadata_Pn$Proneural=="Proneural"]="red"
+filtered_metadata_Pn$Color[filtered_metadata_Pn$Proneural=="Control"] = "yellow"
+colv = as.dendrogram(hclust(as.dist(1-cor(t(as.matrix(filtered_clean_Pn))))))
+rowv = as.dendrogram(hclust(as.dist(1-cor(as.matrix(filtered_clean_Pn)))))
+
+pdf("Heatmap_All_DEG_Proneural_GeneExp.pdf")
+heatmap.2(as.matrix(t(filtered_clean_Pn)), cexCol=0.7,
+          col = rev(redblue(256)), Rowv=rowv, Colv=colv, scale = "row", trace=NULL, tracecol=NULL, ColSideColors = filtered_metadata_Pn$Color)
+legend('topleft', legend = unique(tumorLabels_Pn), fill = unique(filtered_metadata_Pn$Color), border=T, title='Subtype')
+dev.off()
+
+# Cut dendrogram and calculate percentage of "good calls" #
+colvDendr = hclust(as.dist(1-cor(as.matrix(t(filtered_clean_Pn)))))
+plot(colv)
+dend1 <- color_labels(colvDendr, k = 9)
+plot(dend1, main = "default cuts by cutree")
+
+clusterPN = cbind("Cluster" = cutree(colvDendr, k = 9))
+clusterPN_meta = merge(ClinAll, clusterPN, by.x = 1, by.y = 0)
+table(clusterPN_meta$Proneural, clusterPN_meta$Cluster)
+
+clusterPN_meta$clusterClass = NA
+clusterPN_meta$clusterClass[which(!clusterPN_meta$Cluster == 5)] = "Control"
+clusterPN_meta$clusterClass[which(clusterPN_meta$Cluster == 5)] = "Proneural"
+table(clusterPN_meta$Proneural, clusterPN_meta$clusterClass)
+
+success = table(clusterPN_meta$Proneural, clusterPN_meta$clusterClass)[1,1] +
+  table(clusterPN_meta$Proneural, clusterPN_meta$clusterClass)[2,2]
+
+score_PN_All = success/sum(table(clusterPN_meta$Proneural, clusterPN_meta$clusterClass))
+kappa_PN_All = cohen.kappa(x=cbind(clusterPN_meta$Proneural,clusterPN_meta$clusterClass))
+
+# Heatmap Panel #
+centrPN = read.table("Proneural_centroids_GeneExp.csv", sep=";", row.names=1)
+filt_centr_Pn = filtered_clean_Pn[which(colnames(filtered_clean_Pn)%in%rownames(centrPN))]
+colv = as.dendrogram(hclust(as.dist(1-cor(t(as.matrix(filt_centr_Pn))))))
+rowv = as.dendrogram(hclust(as.dist(1-cor(as.matrix(filt_centr_Pn)))))
+
+pdf("Heatmap_5_Genes_Proneural_GeneExp.pdf")
+heatmap.2(as.matrix(t(filt_centr_Pn)), cexCol=0.7,
+          col = rev(redblue(256)), Rowv=rowv, Colv=colv, scale = "row", trace=NULL, tracecol=NULL, ColSideColors = filtered_metadata_Pn$Color)
+legend('topleft', legend = unique(tumorLabels_Pn), fill = unique(filtered_metadata_Pn$Color), border=T, title='Subtype')
+dev.off()
+
+# Cut dendrogram and calculate percentage of "good calls" #
+colvDendr = hclust(as.dist(1-cor(as.matrix(t(filt_centr_Pn)))))
+plot(colv)
+dend1 <- color_labels(colvDendr, k = 6)
+plot(dend1, main = "default cuts by cutree")
+
+clusterPN = cbind("Cluster" = cutree(colvDendr, k = 6))
+clusterPN_meta = merge(ClinAll, clusterPN, by.x = 1, by.y = 0)
+table(clusterPN_meta$Proneural, clusterPN_meta$Cluster)
+
+clusterPN_meta$clusterClass = NA
+clusterPN_meta$clusterClass[which(!clusterPN_meta$Cluster == 3)] = "Control"
+clusterPN_meta$clusterClass[which(clusterPN_meta$Cluster == 3)] = "Proneural"
+table(clusterPN_meta$Proneural, clusterPN_meta$clusterClass)
+
+success = table(clusterPN_meta$Proneural, clusterPN_meta$clusterClass)[1,1] +
+  table(clusterPN_meta$Proneural, clusterPN_meta$clusterClass)[2,2]
+
+score_PN_Panel = success/sum(table(clusterPN_meta$Proneural, clusterPN_meta$clusterClass))
+kappa_PN_Panel = cohen.kappa(x=cbind(clusterPN_meta$Proneural,clusterPN_meta$clusterClass))
+scorePN = cbind("Score All" = score_PN_All, "Score Panel" = score_PN_Panel, "Kappa All" = kappa_PN_All$kappa, "Kappa Panel" = kappa_PN_Panel$kappa)
+
+write.table(scorePN, file = "Score_hierarchical_clustering_Proneural.csv", sep = ";")
+
+# t-SNE All DEG #
+Tsne = Rtsne(as.matrix(filtered_clean_Pn),perplexity = 30, theta = 0, max_iter = 5000)
+
+pdf('tSNE_Proneural_All_DEG.pdf')
+plot(Tsne$Y, main="t-SNE Proneural vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Pn], pch=19)
+legend('topleft', legend = unique(tumorLabels_Pn), fill=plottingColors[unique(tumorLabels_Pn)], border=T, title='Subtype')
+dev.off()
+
+# t-SNE Panel #
+Tsne = Rtsne(as.matrix(filt_centr_Pn),perplexity = 30, theta = 0, max_iter = 5000)
+
+pdf('tSNE_5_genes_Proneural.pdf')
+plot(Tsne$Y, main="t-SNE Proneural vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Pn], pch=19)
+legend('topleft', legend = unique(tumorLabels_Pn), fill=plottingColors[unique(tumorLabels_Pn)], border=T, title='Subtype')
+dev.off()
+
+#### VALIDATION ####
+dataHGCC = read.table("HGCC_data.csv", sep=";", header = TRUE) # Downloaded from http://hgcc.se
+rownames(dataHGCC) = make.names(dataHGCC$Gene.Symbol, unique = TRUE) 
+dataHGCC = dataHGCC[,-1]
+dataHGCC = dataHGCC[order(rownames(dataHGCC)),]
+dataHGCC = as.data.frame(as.matrix(t(scale(as.matrix(t(dataHGCC))))))
+
+#### Classical ####
+centrCL = read.table("Classical_centroids_GeneExp.csv", sep=";", header=TRUE, row.names=1)
+centrCL = centrCL[order(rownames(centrCL)),]
+CLSD = read.table("Classical_SD_GeneExp.csv", sep=";")
+CLSD = CLSD[order(rownames(CLSD)),]
+data_centrCL = list(x = as.matrix(centrCL), y = as.vector(c("Classical", "Control", "Classical", "Control", "Classical", "Control")), geneid = rownames(centrCL),genenames = paste("g",as.character(1:nrow(centrCL)),sep=""))
+train_centrCL = pamr.train(data_centrCL, threshold = 0)
+train_centrCL$sd = CLSD
+
+# Predict subtype classical
+dataHGCC_Cl = dataHGCC[which(rownames(dataHGCC)%in%rownames(centrCL)),]
+prediction_0_cl = pamr.predict(train_centrCL, dataHGCC_Cl, threshold = 0,
+                               type = c("posterior"))
+
+
+#### Mesenchymal ####
+centrME = read.table("Mesenchymal_centroids_GeneExp.csv", sep=";", header=TRUE, row.names=1)
+centrME = centrME[order(rownames(centrME)),]
+MESD = read.table("Mesenchymal_SD_GeneExp.csv", sep=";")
+MESD = MESD[order(rownames(MESD)),]
+data_centrME = list(x = as.matrix(centrME), y = as.vector(c("Control", "Mesenchymal", "Control", "Mesenchymal", "Control", "Mesenchymal")), geneid = rownames(centrME),genenames = paste("g",as.character(1:nrow(centrME)),sep=""))
+train_centrME = pamr.train(data_centrME, threshold = 0)
+train_centrME$sd = MESD
+dataHGCC_Me = dataHGCC[which(rownames(dataHGCC)%in%rownames(centrME)),]
+
+# Predict subtype Mesenchymal
+dataHGCC_Me = dataHGCC[which(rownames(dataHGCC)%in%rownames(centrME)),]
+prediction_0_me = pamr.predict(train_centrME, dataHGCC_Me, threshold = 0,
+                               type = c("posterior"))
+
+CL_ME = merge(prediction_0_cl, prediction_0_me, by=0)
+rownames(CL_ME) = CL_ME[,1]
+CL_ME = CL_ME[,-c(1,3,4)]
+
+#### Proneural ####
+centrPN = read.table("Proneural_centroids_GeneExp.csv", sep=";", header=TRUE, row.names=1)
+centrPN = centrPN[order(rownames(centrPN)),]
+PNSD = read.table("Proneural_SD_GeneExp.csv", sep=";")
+PNSD = PNSD[order(rownames(PNSD)),]
+data_centrPN = list(x = as.matrix(centrPN), y = as.vector(c("Control", "Proneural", "Control", "Proneural", "Control", "Proneural")), geneid = rownames(centrPN),genenames = paste("g",as.character(1:nrow(centrPN)),sep=""))
+train_centrPN = pamr.train(data_centrPN, threshold = 0)
+valid_centrPN = pamr.cv(train_centrPN, data_centrPN)
+train_centrPN$sd = PNSD
+dataHGCC_Pn = dataHGCC[which(rownames(dataHGCC)%in%rownames(centrPN)),]
+
+# Predict subtype Proneural
+dataHGCC_Pn = dataHGCC[which(rownames(dataHGCC)%in%rownames(centrPN)),]
+prediction_0_pn = pamr.predict(train_centrPN, dataHGCC_Pn, threshold = 0,
+                               type = c("posterior"))
+
+All = merge(CL_ME, prediction_0_pn, by=0)
+rownames(All)=All[,1]
+All = All[,-c(1,4)]
+Class = read.table("HGCC_Metadata.csv", sep = ";", header = TRUE, row.names = 1)
+All_class = merge(All, Class, by=0)
+rownames(All_class)=All_class[,1]
+All_class = All_class[,c(2,3,4,5)]
+write.table(All_class, file="HGCC_Classified_by_Centroids.csv", sep=";")
+
+#### DNA METHYLATION ####
+library(MASS)
+library(pamr)
+library(gtools)
+library(ROCR)
+library(varSelRF)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(Rtsne)
+library(RColorBrewer)
+library(gplots)
+library(psych)
+library(dendextend)
+
+ClinTCGA=read.csv("Clinical_Data_TCGA.csv", sep=";", header=TRUE)
+setwd("D:/R/GBM-LGG/GBM Subtypes/DNAm") # Change direction to another to separate gene expression from DNAm
+GBMAll=read.table("Methylation_27_450_GEO.csv", sep=";", row.names=1, header=TRUE)
+barcode = read.table("Barcodes_27_450_GEO.csv", sep=";", header = TRUE) # Excel file that we have created containing barcode and "batch" of each patient in this new cohort (it will be different for each person since it depends on random sampling)
+colnames(GBMAll) = barcode$Barcode # Only to remove the "prefix"
+
+GEOClin=read.csv("GEO122586.csv", row.names=1, sep=";", header=TRUE)
+GEOClint = as.data.frame(as.matrix(t(GEOClin)))
+
+# Convert to M-value
+GBMAll = log2(GBMAll/(1-GBMAll)) 
+GBMAll = na.omit(GBMAll) # Patients with DNAm levels = 1 have NA
+GBMAll_t = as.data.frame(as.matrix(t(GBMAll)))
+
+# Separe cohort
+MetaTCGA = ClinTCGA[which(ClinTCGA$Patient.ID%in%colnames(GBMAll)),]
+Barc27 = barcode$Barcode[which(barcode$Batch == "k27")]
+Barc450 = barcode$Barcode[which(barcode$Batch == "k450")]
+BarcGEO = barcode$Barcode[which(barcode$Batch == "GEO")]
+Meta27 = MetaTCGA[which(MetaTCGA$Patient.ID %in% as.character(Barc27)),]
+Meta450 = MetaTCGA[which(MetaTCGA$Patient.ID %in% as.character(Barc450)),]
+MetaGEO = GEOClint[which(rownames(GEOClint) %in% as.character(BarcGEO)),]
+MetaGEO = MetaGEO[which(colnames(MetaGEO)=="Subtype")]
+
+MetaTCGA = ClinTCGA[which(colnames(ClinTCGA)%in%c("Patient.ID", "Calculated.subtype"))]
+MetaAll = data.frame(barcode = c(as.character(MetaTCGA$Patient.ID), rownames(MetaGEO)), 
+                     subtype = c(as.character(MetaTCGA$Calculated.subtype), as.character(MetaGEO$Subtype)))
+
+MetaAll$Classical = "NA"
+MetaAll$Classical[which(MetaAll$subtype == "Classical")] = "Classical"
+MetaAll$Classical[which(!MetaAll$subtype == "Classical")] = "Control"
+MetaAll$Mesenchymal = "NA"
+MetaAll$Mesenchymal[which(MetaAll$subtype == "Mesenchymal")] = "Mesenchymal"
+MetaAll$Mesenchymal[which(!MetaAll$subtype == "Mesenchymal")] = "Control"
+MetaAll$Proneural = "NA"
+MetaAll$Proneural[which(MetaAll$subtype == "Proneural")] = "Proneural"
+MetaAll$Proneural[which(!MetaAll$subtype == "Proneural")] = "Control"
+
+# 70% training 30 % validation #
+nrow(Meta27) * 0.7
+nrow(Meta450) * 0.7
+nrow(MetaGEO) * 0.7
+
+BarcTrain = c(as.character(sample(Meta27$Patient.ID, 93)), as.character(sample(Meta450$Patient.ID, 20)), as.character(sample(rownames(MetaGEO), 13)))
+write.table(BarcTrain, file = "Training_Barcodes.csv", sep = ";") # The results will be variable since the selection of samples here is randomized
+
+MetaTrain = MetaAll[which(MetaAll$barcode %in% BarcTrain),]
+
+BarcAll = c(Meta27$Patient.ID, Meta450$Patient.ID, rownames(MetaGEO))
+BarcVal = BarcAll[which(!BarcAll%in%BarcTrain)]
+MetaVal = MetaAll[which(MetaAll$barcode %in% BarcVal),]
+
+GBM_train = GBMAll[which(colnames(GBMAll)%in%BarcTrain)]
+
+GBM = as.data.frame(as.matrix(t(GBM_train)))
+GBM_t = as.data.frame(as.matrix(t(GBM)))
+
+Clin_cl = subset(MetaTrain, MetaTrain$subtype=="Classical")
+Clin_me = subset(MetaTrain, MetaTrain$subtype=="Mesenchymal")
+Clin_pn = subset(MetaTrain, MetaTrain$subtype=="Proneural")
+
+#### CLASSICAL ####
+Clin_cl = subset(MetaTrain, MetaTrain$subtype=="Classical")
+Clin_cont = subset(MetaTrain, !MetaTrain$subtype=="Classical")
+barcodeCL = Clin_cl$barcode
+barcodeCont = Clin_cont$barcode
+
+Met_Cl = GBM[which(rownames(GBM) %in% barcodeCL),]
+Met_Cl_t = as.data.frame(as.matrix(t(Met_Cl)))
+
+Met_Cont = GBM[which(!rownames(GBM) %in% barcodeCL),]
+Met_Cont_t = as.data.frame(as.matrix(t(Met_Cont)))
+
+CL.mean = apply(Met_Cl_t, 1, mean)
+CONTR.mean = apply(Met_Cont_t,1, mean)
+
+fold_Cl = (CL.mean-CONTR.mean)
+
+# Compute statistical significance #
+pvalue_Cl = NULL
+tstat_Cl = NULL
+for(i in 1 : nrow(Met_Cl_t)) {
+  x = Met_Cl_t[i,]
+  y = Met_Cont_t[i,]
+  
+  t = t.test(x, y) 
+  pvalue_Cl[i] = t$p.value
+  tstat_Cl[i] = t$statistic
+}
+
+qvalue_Cl = p.adjust(pvalue_Cl, method = "fdr", n = length(pvalue_Cl)) # Correction by False Discovery Rate
+
+combined_Cl  = cbind(qvalue_Cl, fold_Cl, abs(fold_Cl), GBM_t)
+combined_Cl_t = as.data.frame(as.matrix(t(combined_Cl)))
+
+# Filter per Z-Ratio and qvalue #
+fold_cutoff = 1
+qvalue_cutoff = 0.05
+
+# fold-change filter for "biological" significance
+filter_by_fold_Cl = abs(fold_Cl) >= fold_cutoff
+dim(GBM_t[filter_by_fold_Cl, ]) 
+
+# P-value filter for "statistical" significance
+filter_by_qvalue_Cl = qvalue_Cl <= qvalue_cutoff
+dim(GBM_t[filter_by_qvalue_Cl, ]) 
+
+# Combined filter (both biological and statistical)
+filter_combined_Cl = filter_by_fold_Cl & filter_by_qvalue_Cl 
+
+filtered_Cl = GBM_t[filter_combined_Cl,]
+dim(filtered_Cl)
+filtered_combined_Cl = merge(combined_Cl, filtered_Cl, by=0)
+Probes_with_changes_Cl = filtered_combined_Cl[,1:4]
+UpProbes_Cl = Probes_with_changes_Cl$Row.names[which(Probes_with_changes_Cl$fold>0)]
+DownProbes_Cl = Probes_with_changes_Cl$Row.names[which(Probes_with_changes_Cl$fold<0)]
+write.table(Probes_with_changes_Cl, file = "DMS_Classical.csv", sep = ";")
+
+# Create dataframe with Subtype data #
+tumorMetadata_Cl = cbind("barcode" = as.character(MetaTrain$barcode), "Classical" = as.character(MetaTrain$Classical))
+filtered_t_Cl = as.data.frame(as.matrix(t(filtered_Cl)))
+filtered_metadata_Cl = merge(tumorMetadata_Cl, filtered_t_Cl, by.x=1, by.y=0)
+rownames(filtered_metadata_Cl) = filtered_metadata_Cl[,1]
+names(filtered_metadata_Cl) = c(as.character(colnames(tumorMetadata_Cl)), as.character(colnames(filtered_t_Cl)))
+tumorLabels_Cl = as.character(filtered_metadata_Cl$Classical)
+plottingColors = c("Red", "cadetblue")
+names(plottingColors) = unique(tumorLabels_Cl)
+
+filtered_metadata_t_Cl = as.data.frame(as.matrix(t(filtered_metadata_Cl)))
+filtered_clean_Cl = filtered_metadata_Cl[,-c(1,2)]
+filtered_clean_t_Cl = as.data.frame(as.matrix(t(filtered_clean_Cl)))
+
+# Use Random Forest and Nearest Shrunken Centroid to select the features for the panel #
+Cl_Probes = lapply(1:300,
+                   function(x){
+                     
+                     # Random Forest #
+                     ProbesUp = Probes_with_changes_Cl[which(Probes_with_changes_Cl$fold_Cl > 0),][,1]
+                     ProbesDown = Probes_with_changes_Cl[which(Probes_with_changes_Cl$fold_Cl < 0),][,1]
+                     
+                     RF_Cl = varSelRF(filtered_clean_Cl, as.factor(tumorLabels_Cl), c.sd = 2, mtryFactor = 1, ntree = 1000,
+                                      ntreeIterat = 500, vars.drop.num = NULL, vars.drop.frac = 0.2,
+                                      whole.range = TRUE, recompute.var.imp = TRUE, verbose = FALSE,
+                                      returnFirstForest = FALSE, fitted.rf = NULL, keep.forest = FALSE)
+                     
+                     sel_hist = RF_Cl$selec.history
+                     sel_hist=sel_hist[order(sel_hist$Number.Variables),]
+                     sel_hist=sel_hist[order(sel_hist$OOB),]
+                     sel_hist2=data.frame(x = sel_hist$Vars.in.Forest)
+                     All_variables = sel_hist2 %>% separate(x, as.character(1:ncol(filtered_clean_Cl)))
+                     sel_Probes = na.omit(as.factor(All_variables[1,]))
+                     sel_Probes = droplevels.factor(sel_Probes)
+                     RF_Probes = as.vector(sel_Probes)
+                     
+                     # Nearest Shrunken Centroid #
+                     filt100_t = subset(filtered_clean_t_Cl, rownames(filtered_clean_t_Cl)%in%RF_Probes)
+                     filt100 = as.data.frame(as.matrix(t(filt100_t)))
+                     subsetCentroid = as.data.frame(as.matrix(t(filt100)))
+                     
+                     data_All = list(x = as.matrix(subsetCentroid), y = as.vector(tumorLabels_Cl), 
+                                     geneid = rownames(subsetCentroid),
+                                     genenames = paste("g",as.character(1:nrow(subsetCentroid)),sep=""))
+                     
+                     training_All = pamr.train(data_All)
+                     valid_All = pamr.cv(training_All, data_All)
+                     valid_All
+                     Probes1 = pamr.listgenes(training_All, data_All, threshold = 0.5, fitcv=valid_All)
+                     Probes1Up = Probes1[,1][which(Probes1[,2]>0)]
+                     Probes1Down = Probes1[,1][which(Probes1[,2]<0)]
+                     selected_Probes = c(Probes1Up[1:2], Probes1Down[1:2], as.character(Probes1[,1]))
+                     selected_Probes = unique(selected_Probes)[1:5]
+                     
+                     print(x)
+                     
+                     selected_Probes
+                   })
+
+
+Cl_Probes_Sorted = lapply(1:100,
+                          function(k){
+                            sort(Cl_Probes[[k]])
+                          })  
+
+# Select the most repeated combination #
+n.obs = sapply(Cl_Probes_Sorted, length)
+seq.max = seq_len(max(n.obs))
+ClComb = as.data.frame(t(sapply(Cl_Probes_Sorted, "[", i = seq.max)))
+
+get_perm = function(v) {
+  m = permutations(n = length(v), r = length(v), v = v, set = F)
+  m[order(c(m))]
+}
+All = map(Cl_Probes_Sorted, get_perm)
+unique = map(Cl_Probes_Sorted, get_perm) %>% unique()
+res_vec = c()
+element = c()
+
+for(i in seq_along(unique)) {
+  element[[i]] = unique[[i]] %>% unique() %>% paste(collapse = ",")
+  res_vec[[i]] = All %in% unique[i] %>% sum()
+}
+
+repetitions_Cl=tibble(
+  elements = unlist(element),
+  numbers = res_vec
+)
+
+repeat1_Cl = repetitions_Cl[order(-as.numeric(repetitions_Cl$numbers)),]
+CLProbes = strsplit(as.character(repeat1_Cl[1,1]), ",")
+CLProbes = CLProbes[[1]]
+colorROC = rep(brewer.pal(n = 9, name = "YlOrRd"), 17)
+
+# Create centroids in groups of the same number of patients #
+pdf("ROC_Classical_DNAm.pdf")
+Centr100_Cl = lapply(1:300,
+                     function(x){
+                       Clin_cl_t = as.data.frame(as.matrix(t(Clin_cl)))
+                       Clin_cl30 = as.data.frame(as.matrix(t(sample(Clin_cl_t, min(table(MetaTrain$subtype))))))
+                       Clin_me_t = as.data.frame(as.matrix(t(Clin_me)))
+                       Clin_me30 = as.data.frame(as.matrix(t(sample(Clin_me_t, min(table(MetaTrain$subtype))))))
+                       Clin_pn_t = as.data.frame(as.matrix(t(Clin_pn)))
+                       Clin_pn30 = as.data.frame(as.matrix(t(sample(Clin_pn_t, min(table(MetaTrain$subtype))))))
+                       Clin = rbind(Clin_cl30, Clin_me30, Clin_pn30)
+                       
+                       GBM = subset(GBMAll_t, rownames(GBMAll_t)%in%Clin$barcode)
+                       GBM_t = as.data.frame(as.matrix(t(GBM)))
+                       barcode = rownames(GBM)
+                       
+                       tumorMetadata_Cl = cbind("barcode" = as.character(Clin$barcode), "Classical" = as.character(Clin$Classical))
+                       filtered_t_Cl = GBM[,which(colnames(GBM)%in%CLProbes)]
+                       filtered_metadata_Cl = merge(tumorMetadata_Cl, filtered_t_Cl, by.x=1, by.y=0)
+                       names(filtered_metadata_Cl) = c(as.character(colnames(tumorMetadata_Cl)), as.character(colnames(filtered_t_Cl)))
+                       tumorLabels_Cl = as.character(filtered_metadata_Cl$Classical)
+                       plottingColors = c("Red", "cadetblue")
+                       names(plottingColors) = unique(tumorLabels_Cl)
+                       
+                       filtered_metadata_t_Cl = as.data.frame(as.matrix(t(filtered_metadata_Cl)))
+                       filtered_clean_Cl = filtered_metadata_Cl[,-c(1,2)]
+                       filtered_clean_t_Cl = as.data.frame(as.matrix(t(filtered_clean_Cl)))
+                       
+                       
+                       data_All = list(x = as.matrix(filtered_clean_t_Cl), y = as.vector(tumorLabels_Cl), 
+                                       geneid = rownames(filtered_clean_t_Cl),
+                                       genenames = paste("g",as.character(1:nrow(filtered_clean_t_Cl)),sep=""))
+                       
+                       training_All = pamr.train(data_All, threshold = 0)
+                       valid_All = pamr.cv(training_All, data_All)
+                       valid_prob_Best1 = as.data.frame(valid_All$prob)
+                       scores_Best1=valid_prob_Best1[,2]
+                       ROCR.simple_Best1 = list(predictions=scores_Best1, labels=tumorLabels_Cl)
+                       pred_Best1 = prediction(ROCR.simple_Best1$predictions, ROCR.simple_Best1$labels)
+                       perf_Best1 = performance(pred_Best1,"tpr","fpr")
+                       perfAUC_Best1 = performance(pred_Best1,"tpr","fpr", measure="auc")
+                       AUC_Col = as.data.frame(cbind(perfAUC_Best1@y.values))
+                       AUC_Col$Col = NA
+                       AUC_Col$Col[which(AUC_Col > 0.7)] = colorROC[1]
+                       AUC_Col$Col[which(AUC_Col > 0.8)] = colorROC[2]
+                       AUC_Col$Col[which(AUC_Col > 0.825)] = colorROC[3]
+                       AUC_Col$Col[which(AUC_Col > 0.85)] = colorROC[4]
+                       AUC_Col$Col[which(AUC_Col > 0.875)] = colorROC[5]
+                       AUC_Col$Col[which(AUC_Col > 0.9)] = colorROC[6]
+                       AUC_Col$Col[which(AUC_Col > 0.925)] = colorROC[7]
+                       AUC_Col$Col[which(AUC_Col > 0.95)] = colorROC[8]
+                       AUC_Col$Col[which(AUC_Col > 0.975)] = colorROC[9]
+                       plot(perf_Best1, col = AUC_Col$Col, xlim=c(0,1), ylim=c(0,1), lwd = 2)
+                       par(new=TRUE)
+                       
+                       list(CLProbes, valid_All$error, training_All$centroids, training_All$sd, valid_All, perfAUC_Best1@y.values)               
+                     })
+dev.off()
+par(new=FALSE)
+
+# Obtain centroids #
+centrList_Cl = sapply(1:length(Centr100_Cl),
+                      function(x){
+                        list(Centr100_Cl[[x]][[3]])
+                      })
+centrCL = Reduce("+", centrList_Cl)/length(Centr100_Cl)
+
+SDListCL = sapply(1:length(Centr100_Cl),
+                  function(x){
+                    list(Centr100_Cl[[x]][[4]])
+                  })
+
+CLSD = Reduce("+", SDListCL)/length(Centr100_Cl)
+
+error_Cl = sapply(1:length(Centr100_Cl),
+                  function(x){
+                    list(Centr100_Cl[[x]][[2]])
+                  })
+mean(unlist(error_Cl))
+
+write.table(error_Cl, file="Error_rate_Classical_DNAm.csv", sep=";")
+
+AUC_Cl = sapply(1:length(Centr100_Cl),
+                function(x){
+                  list(Centr100_Cl[[x]][[6]][[1]])
+                })
+mean(unlist(AUC_Cl))
+write.table(AUC_Cl, file="AUC_Classical_DNAm.csv", sep=";")
+
+# "Synthetic" Centroid #
+centrCL = cbind(centrCL, centrCL[,1]+0.0000001, centrCL[,2]+0.0000001, centrCL[,1]-0.0000001, centrCL[,2]-0.0000001) # Add more than one column to the centroid, and then we will add the SD manuAlly
+write.table(CLSD, file="Classical_SD_DNAm.csv", sep=";")
+write.table(centrCL, file="Classical_centroids_DNAm.csv", sep=";")
+
+# Figures #
+# Volcano Plot
+pdf("Volcano_Plot_Classical_DNAm.pdf")
+plot(fold_Cl, -log10(qvalue_Cl), main = "Classical vs Control - Volcano", xlim=c(-4, 4), ylim=c(0,12), xlab="fold")
+points (fold_Cl[filter_combined_Cl & fold_Cl > 0],
+        -log10(qvalue_Cl[filter_combined_Cl & fold_Cl > 0]),
+        pch = 16, col = "red")
+points (fold_Cl[filter_combined_Cl & fold_Cl < 0],
+        -log10(qvalue_Cl[filter_combined_Cl & fold_Cl < 0]),
+        pch = 16, col = "blue")
+
+abline(v = fold_cutoff, col = "red", lwd = 3)
+abline(v = -fold_cutoff, col = "blue", lwd = 3)
+abline(h = -log10(qvalue_cutoff), col = "grey", lwd = 3)
+dev.off()
+
+# Heatmap All DEG #
+filtered_metadata_Cl$Color[filtered_metadata_Cl$Classical=="Classical"]="red"
+filtered_metadata_Cl$Color[filtered_metadata_Cl$Classical=="Control"] = "yellow"
+colv = as.dendrogram(hclust(as.dist(1-cor(t(as.matrix(filtered_clean_Cl))))))
+rowv = as.dendrogram(hclust(as.dist(1-cor(as.matrix(filtered_clean_Cl)))))
+
+pdf("Heatmap_All_DEG_Classical_DNAm.pdf")
+heatmap.2(as.matrix(t(filtered_clean_Cl)), cexCol=0.7,
+          col = rev(redblue(256)), Rowv=rowv, Colv=colv, scale = "row", trace=NULL, tracecol=NULL, ColSideColors = filtered_metadata_Cl$Color)
+legend('topleft', legend = unique(tumorLabels_Cl), fill = unique(filtered_metadata_Cl$Color), border=T, title='Subtype')
+dev.off()
+
+
+# Cut dendrogram and calculate percentage of "good calls" #
+colvDendr = hclust(as.dist(1-cor(as.matrix(t(filtered_clean_Cl)))))
+plot(colv)
+dend1 <- color_labels(colvDendr, k = 5)
+plot(dend1, main = "default cuts by cutree")
+
+clusterCL = cbind("Cluster" = cutree(colvDendr, k = 5))
+clusterCL_meta = merge(MetaTrain, clusterCL, by.x = 1, by.y = 0)
+table(clusterCL_meta$Classical, clusterCL_meta$Cluster)
+
+clusterCL_meta$ClusterClass = NA
+clusterCL_meta$ClusterClass[which(!clusterCL_meta$Cluster == 2)] = "Control"
+clusterCL_meta$ClusterClass[which(clusterCL_meta$Cluster == 2)] = "Classical"
+table(clusterCL_meta$Classical, clusterCL_meta$ClusterClass)
+
+success = table(clusterCL_meta$Classical, clusterCL_meta$ClusterClass)[1,1] +
+  table(clusterCL_meta$Classical, clusterCL_meta$ClusterClass)[2,2]
+
+score_CL_All = success/sum(table(clusterCL_meta$Classical, clusterCL_meta$ClusterClass))
+kappa_CL_ALL = cohen.kappa(x=cbind(clusterCL_meta$Classical,clusterCL_meta$ClusterClass))
+
+# Heatmap Panel #
+centrCL = read.table("Classical_centroids_DNAm.csv", sep=";", row.names=1)
+filt_centr_Cl = filtered_clean_Cl[which(colnames(filtered_clean_Cl)%in%rownames(centrCL))]
+colv = as.dendrogram(hclust(as.dist(1-cor(t(as.matrix(filt_centr_Cl))))))
+rowv = as.dendrogram(hclust(as.dist(1-cor(as.matrix(filt_centr_Cl)))))
+
+pdf("Heatmap_5_Probes_Classical_DNAm.pdf")
+heatmap.2(as.matrix(t(filt_centr_Cl)), cexCol=0.7,
+          col = rev(redblue(256)), Rowv=rowv, Colv=colv, scale = "row", trace=NULL, tracecol=NULL, ColSideColors = filtered_metadata_Cl$Color)
+legend('topleft', legend = unique(tumorLabels_Cl), fill = unique(filtered_metadata_Cl$Color), border=T, title='Subtype')
+dev.off()
+
+
+# Cut dendrogram and calculate percentage of "good calls" #
+colvDendr = hclust(as.dist(1-cor(as.matrix(t(filt_centr_Cl)))))
+plot(colv)
+dend1 <- color_labels(colvDendr, k = 10)
+plot(dend1, main = "default cuts by cutree")
+
+clusterCL = cbind("Cluster" = cutree(colvDendr, k = 10))
+clusterCL_meta = merge(MetaTrain, clusterCL, by.x = 1, by.y = 0)
+table(clusterCL_meta$Classical, clusterCL_meta$Cluster)
+
+clusterCL_meta$ClusterClass = NA
+clusterCL_meta$ClusterClass[which(!clusterCL_meta$Cluster == 2)] = "Control"
+clusterCL_meta$ClusterClass[which(clusterCL_meta$Cluster == 2)] = "Classical"
+table(clusterCL_meta$Classical, clusterCL_meta$ClusterClass)
+
+success = table(clusterCL_meta$Classical, clusterCL_meta$ClusterClass)[1,1] +
+  table(clusterCL_meta$Classical, clusterCL_meta$ClusterClass)[2,2]
+
+score_CL_Panel = success/sum(table(clusterCL_meta$Classical, clusterCL_meta$ClusterClass))
+kappa_CL_Panel = cohen.kappa(x=cbind(clusterCL_meta$Classical,clusterCL_meta$ClusterClass))
+scoreCL = cbind("Score All" = score_CL_All, "Score Panel" = score_CL_Panel, "Kappa All" = kappa_CL_ALL$kappa, "Kappa Panel" = kappa_CL_Panel$kappa)
+
+write.table(scoreCL, file = "DNAm - Score_hierarchical_clustering_Classical.csv", sep = ";")
+
+# t-SNE All DEG #
+Tsne = Rtsne(as.matrix(filtered_clean_Cl),perplexity = 30, theta = 0, max_iter = 5000)
+
+pdf('tSNE_Classical_All_DEG.pdf')
+plot(Tsne$Y, main="t-SNE Classical vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Cl], pch=19)
+legend('topleft', legend = unique(tumorLabels_Cl), fill=plottingColors[unique(tumorLabels_Cl)], border=T, title='Subtype')
+dev.off()
+
+# t-SNE Panel #
+Tsne = Rtsne(as.matrix(filt_centr_Cl),perplexity = 30, theta = 0, max_iter = 5000)
+
+pdf('tSNE_5_Probes_Classical.pdf')
+plot(Tsne$Y, main="t-SNE Classical vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Cl], pch=19)
+legend('topleft', legend = unique(tumorLabels_Cl), fill=plottingColors[unique(tumorLabels_Cl)], border=T, title='Subtype')
+dev.off()
+
+#### MESENCHYMAL ####
+Clin_me = subset(MetaTrain, MetaTrain$Mesenchymal=="Mesenchymal")
+Clin_cont = subset(MetaTrain, MetaTrain$Mesenchymal=="Control")
+barcodeME = Clin_me$barcode
+barcodeCont = Clin_cont$barcode
+
+Met_Me = GBM[which(rownames(GBM) %in% barcodeME),]
+Met_Me_t = as.data.frame(as.matrix(t(Met_Me)))
+
+Met_Cont = GBM[which(!rownames(GBM) %in% barcodeME),]
+Met_Cont_t = as.data.frame(as.matrix(t(Met_Cont)))
+
+ME.mean = apply(Met_Me_t, 1, mean)
+CONTR.mean = apply(Met_Cont_t,1, mean)
+
+fold_Me = (ME.mean-CONTR.mean)
+
+# Compute statistical significance #
+pvalue_Me = NULL
+tstat_Me = NULL
+for(i in 1 : nrow(Met_Me_t)) {
+  x = Met_Me_t[i,]
+  y = Met_Cont_t[i,]
+  
+  t = t.test(x, y) 
+  pvalue_Me[i] = t$p.value
+  tstat_Me[i] = t$statistic
+}
+
+qvalue_Me = p.adjust(pvalue_Me, method = "fdr", n = length(pvalue_Me)) # Correction by False Discovery Rate
+combined_Me = cbind(qvalue_Me, fold_Me, abs(fold_Me), GBM_t)
+
+# Filter per Z-Ratio and qvalue #
+fold_cutoff = 1
+qvalue_cutoff = 0.05
+
+# fold-change filter for "biological" significance
+filter_by_fold_Me = abs(fold_Me) >= fold_cutoff
+dim(GBM_t[filter_by_fold_Me, ]) 
+
+# P-value filter for "statistical" significance
+filter_by_qvalue_Me = qvalue_Me <= qvalue_cutoff
+dim(GBM_t[filter_by_qvalue_Me, ]) 
+
+# Combined filter (both biological and statistical)
+filter_combined_Me = filter_by_fold_Me & filter_by_qvalue_Me 
+
+filtered_Me = GBM_t[filter_combined_Me,]
+dim(filtered_Me)
+filtered_combined_Me = merge(combined_Me, filtered_Me, by=0)
+Probes_with_changes_Me = filtered_combined_Me[,1:4]
+UpProbes_Me = Probes_with_changes_Me$Row.names[which(Probes_with_changes_Me$fold>0)]
+DownProbes_Me = Probes_with_changes_Me$Row.names[which(Probes_with_changes_Me$fold<0)]
+write.table(Probes_with_changes_Me, file = "DMS_Mesenchymal.csv", sep = ";")
+
+# Create dataframe with Subtype data #
+tumorMetadata_Me = cbind("barcode" = as.character(MetaTrain$barcode), "Mesenchymal" = as.character(MetaTrain$Mesenchymal))
+filtered_t_Me = as.data.frame(as.matrix(t(filtered_Me)))
+filtered_metadata_Me = merge(tumorMetadata_Me, filtered_t_Me, by.x=1, by.y=0)
+rownames(filtered_metadata_Me) = filtered_metadata_Me[,1]
+names(filtered_metadata_Me) = c(as.character(colnames(tumorMetadata_Me)), as.character(colnames(filtered_t_Me)))
+tumorLabels_Me = as.character(filtered_metadata_Me$Mesenchymal)
+plottingColors = c("Red", "cadetblue")
+names(plottingColors) = unique(tumorLabels_Me)
+
+filtered_metadata_t_Me = as.data.frame(as.matrix(t(filtered_metadata_Me)))
+filtered_clean_Me = filtered_metadata_Me[,-c(1,2)]
+filtered_clean_t_Me = as.data.frame(as.matrix(t(filtered_clean_Me)))
+
+
+# Use Random Forest and Nearest Shrunken Centroid to select the features for the panel #
+Me_Probes = lapply(1:300,
+                   function(x){
+                     
+                     # Random Forest #
+                     RF_Me = varSelRF(filtered_clean_Me, as.factor(tumorLabels_Me), c.sd = 2, mtryFactor = 1, ntree = 1000,
+                                      ntreeIterat = 500, vars.drop.num = NULL, vars.drop.frac = 0.2,
+                                      whole.range = TRUE, recompute.var.imp = TRUE, verbose = FALSE,
+                                      returnFirstForest = FALSE, fitted.rf = NULL, keep.forest = FALSE)
+                     
+                     sel_hist = RF_Me$selec.history
+                     sel_hist=sel_hist[order(sel_hist$Number.Variables),]
+                     sel_hist=sel_hist[order(sel_hist$OOB),]
+                     sel_hist2=data.frame(x = sel_hist$Vars.in.Forest)
+                     All_variables = sel_hist2 %>% separate(x, as.character(1:ncol(filtered_clean_Me)))
+                     sel_Probes = na.omit(as.factor(All_variables[1,]))
+                     sel_Probes = droplevels.factor(sel_Probes)
+                     RF_Probes = as.vector(sel_Probes)
+                     
+                     # Nearest Shrunken Centroid #
+                     filt100_t = subset(filtered_clean_t_Me, rownames(filtered_clean_t_Me)%in%RF_Probes)
+                     filt100 = as.data.frame(as.matrix(t(filt100_t)))
+                     subsetCentroid = as.data.frame(as.matrix(t(filt100)))
+                     
+                     data_All = list(x = as.matrix(subsetCentroid), y = as.vector(tumorLabels_Me), 
+                                     geneid = rownames(subsetCentroid),
+                                     genenames = paste("g",as.character(1:nrow(subsetCentroid)),sep=""))
+                     
+                     training_All = pamr.train(data_All)
+                     valid_All = pamr.cv(training_All, data_All)
+                     valid_All
+                     Probes1 = pamr.listgenes(training_All, data_All, threshold = 0.5, fitcv=valid_All)
+                     Probes1Up = Probes1[,1][which(Probes1[,2]>0)]
+                     Probes1Down = Probes1[,1][which(Probes1[,2]<0)]
+                     selected_Probes = c(Probes1Up[1:2], Probes1Down[1:2], as.character(Probes1[,1]))
+                     selected_Probes = unique(selected_Probes)[1:5]
+                     
+                     print(x)
+                     
+                     selected_Probes
+                   })
+
+
+Me_Probes_Sorted = lapply(1:300,
+                          function(k){
+                            sort(Me_Probes[[k]])
+                          })  
+
+# Select the most repeated combination #
+n.obs = sapply(Me_Probes_Sorted, length)
+seq.max = seq_len(max(n.obs))
+ClComb = as.data.frame(t(sapply(Me_Probes_Sorted, "[", i = seq.max)))
+
+get_perm = function(v) {
+  m = permutations(n = length(v), r = length(v), v = v, set = F)
+  m[order(c(m))]
+}
+All = map(Me_Probes_Sorted, get_perm)
+unique = map(Me_Probes_Sorted, get_perm) %>% unique()
+res_vec = c()
+element = c()
+
+for(i in seq_along(unique)) {
+  element[[i]] = unique[[i]] %>% unique() %>% paste(collapse = ",")
+  res_vec[[i]] = All %in% unique[i] %>% sum()
+}
+
+repetitions_Me=tibble(
+  elements = unlist(element),
+  numbers = res_vec
+)
+
+repeat1_Me = repetitions_Me[order(-as.numeric(repetitions_Me$numbers)),]
+MEProbes = strsplit(as.character(repeat1_Me[1,1]), ",")
+MEProbes = MEProbes[[1]]
+
+colorROC = rep(brewer.pal(n = 9, name = "YlOrRd"), 17)
+
+# Create centroids in groups of the same number of patients #
+pdf("ROC_Mesenchymal_DNAm.pdf")
+Centr100_Me = lapply(1:300,
+                     function(x){
+                       Clin_cl_t = as.data.frame(as.matrix(t(Clin_cl)))
+                       Clin_cl30 = as.data.frame(as.matrix(t(sample(Clin_cl_t, min(table(MetaTrain$subtype))))))
+                       Clin_me_t = as.data.frame(as.matrix(t(Clin_me)))
+                       Clin_me30 = as.data.frame(as.matrix(t(sample(Clin_me_t, min(table(MetaTrain$subtype))))))
+                       Clin_pn_t = as.data.frame(as.matrix(t(Clin_pn)))
+                       Clin_pn30 = as.data.frame(as.matrix(t(sample(Clin_pn_t, min(table(MetaTrain$subtype))))))
+                       Clin = rbind(Clin_cl30, Clin_me30, Clin_pn30)
+                       
+                       GBM = subset(GBMAll_t, rownames(GBMAll_t)%in%Clin$barcode)
+                       GBM_t = as.data.frame(as.matrix(t(GBM)))
+                       barcode = rownames(GBM)
+                       
+                       tumorMetadata_Me = cbind("barcode" = as.character(Clin$barcode), "Mesenchymal" = as.character(Clin$Mesenchymal))
+                       filtered_t_Me = GBM[,which(colnames(GBM)%in%MEProbes)]
+                       filtered_metadata_Me = merge(tumorMetadata_Me, filtered_t_Me, by.x=1, by.y=0)
+                       names(filtered_metadata_Me) = c(as.character(colnames(tumorMetadata_Me)), as.character(colnames(filtered_t_Me)))
+                       tumorLabels_Me = as.character(filtered_metadata_Me$Mesenchymal)
+                       plottingColors = c("Red", "cadetblue")
+                       names(plottingColors) = unique(tumorLabels_Me)
+                       
+                       filtered_metadata_t_Me = as.data.frame(as.matrix(t(filtered_metadata_Me)))
+                       filtered_clean_Me = filtered_metadata_Me[,-c(1,2)]
+                       filtered_clean_t_Me = as.data.frame(as.matrix(t(filtered_clean_Me)))
+                       
+                       
+                       data_All = list(x = as.matrix(filtered_clean_t_Me), y = as.vector(tumorLabels_Me), 
+                                       geneid = rownames(filtered_clean_t_Me),
+                                       genenames = paste("g",as.character(1:nrow(filtered_clean_t_Me)),sep=""))
+                       
+                       training_All = pamr.train(data_All, threshold = 0)
+                       valid_All = pamr.cv(training_All, data_All)
+                       valid_prob_Best1 = as.data.frame(valid_All$prob)
+                       scores_Best1=valid_prob_Best1[,2]
+                       ROCR.simple_Best1 = list(predictions=scores_Best1, labels=tumorLabels_Me)
+                       pred_Best1 = prediction(ROCR.simple_Best1$predictions, ROCR.simple_Best1$labels)
+                       perf_Best1 = performance(pred_Best1,"tpr","fpr")
+                       perfAUC_Best1 = performance(pred_Best1,"tpr","fpr", measure="auc")
+                       AUC_Col = as.data.frame(cbind(perfAUC_Best1@y.values))
+                       AUC_Col$Col = NA
+                       AUC_Col$Col[which(AUC_Col > 0.7)] = colorROC[1]
+                       AUC_Col$Col[which(AUC_Col > 0.8)] = colorROC[2]
+                       AUC_Col$Col[which(AUC_Col > 0.825)] = colorROC[3]
+                       AUC_Col$Col[which(AUC_Col > 0.85)] = colorROC[4]
+                       AUC_Col$Col[which(AUC_Col > 0.875)] = colorROC[5]
+                       AUC_Col$Col[which(AUC_Col > 0.9)] = colorROC[6]
+                       AUC_Col$Col[which(AUC_Col > 0.925)] = colorROC[7]
+                       AUC_Col$Col[which(AUC_Col > 0.95)] = colorROC[8]
+                       AUC_Col$Col[which(AUC_Col > 0.975)] = colorROC[9]
+                       plot(perf_Best1, col = AUC_Col$Col, xlim=c(0,1), ylim=c(0,1), lwd = 2)
+                       par(new=TRUE)
+                       
+                       list(MEProbes, valid_All$error, training_All$centroids, training_All$sd, valid_All, perfAUC_Best1@y.values)               
+                     })
+dev.off()
+par(new=FALSE)
+
+# Obtain centroids #
+centrList_Me = sapply(1:length(Centr100_Me),
+                      function(x){
+                        list(Centr100_Me[[x]][[3]])
+                      })
+centrME = Reduce("+", centrList_Me)/length(Centr100_Me)
+
+SDListME = sapply(1:length(Centr100_Me),
+                  function(x){
+                    list(Centr100_Me[[x]][[4]])
+                  })
+
+MESD = Reduce("+", SDListME)/length(Centr100_Me)
+
+error_Me = sapply(1:length(Centr100_Me),
+                  function(x){
+                    list(Centr100_Me[[x]][[2]])
+                  })
+write.table(error_Me, file="Error_rate_Mesenchymal_DNAm.csv", sep=";")
+
+AUC_Me = sapply(1:length(Centr100_Me),
+                function(x){
+                  list(Centr100_Me[[x]][[6]][[1]])
+                })
+write.table(AUC_Me, file="AUC_Mesenchymal_DNAm.csv", sep=";")
+
+# "Synthetic" Centroid #
+centrME = cbind(centrME, centrME[,1]+0.0000001, centrME[,2]+0.0000001, centrME[,1]-0.0000001, centrME[,2]-0.0000001) # Add more than one column to the centroid, and then we will add the SD manuAlly
+write.table(MESD, file="Mesenchymal_SD_DNAm.csv", sep=";")
+write.table(centrME, file="Mesenchymal_centroids_DNAm.csv", sep=";")
+
+# Figures #
+# Volcano Plot #
+pdf("Volcano_Plot_Mesenchymal_DNAm.pdf")
+plot(fold_Me, -log10(qvalue_Me), main = "Mesenchymal vs Control - Volcano", xlim=c(-4, 4), ylim=c(0,12), xlab="fold")
+points (fold_Me[filter_combined_Me & fold_Me > 0],
+        -log10(qvalue_Me[filter_combined_Me & fold_Me > 0]),
+        pch = 16, col = "red")
+points (fold_Me[filter_combined_Me & fold_Me < 0],
+        -log10(qvalue_Me[filter_combined_Me & fold_Me < 0]),
+        pch = 16, col = "blue")
+
+abline(v = fold_cutoff, col = "red", lwd = 3)
+abline(v = -fold_cutoff, col = "blue", lwd = 3)
+abline(h = -log10(qvalue_cutoff), col = "grey", lwd = 3)
+dev.off()
+
+# Heatmap All DEG #
+filtered_metadata_Me$Color[filtered_metadata_Me$Mesenchymal=="Mesenchymal"]="red"
+filtered_metadata_Me$Color[filtered_metadata_Me$Mesenchymal=="Control"] = "yellow"
+colv = as.dendrogram(hclust(as.dist(1-cor(t(as.matrix(filtered_clean_Me))))))
+rowv = as.dendrogram(hclust(as.dist(1-cor(as.matrix(filtered_clean_Me)))))
+
+pdf("Heatmap_All_DEG_Mesenchymal_DNAm.pdf")
+heatmap.2(as.matrix(t(filtered_clean_Me)), cexCol=0.7,
+          col = rev(redblue(256)), Rowv=rowv, Colv=colv, scale = "row", trace=NULL, tracecol=NULL, ColSideColors = filtered_metadata_Me$Color)
+legend('topleft', legend = unique(tumorLabels_Me), fill = unique(filtered_metadata_Me$Color), border=T, title='Subtype')
+dev.off()
+
+# Cut dendrogram and calculate percentage of "good calls" #
+colvDendr = hclust(as.dist(1-cor(as.matrix(t(filtered_clean_Me)))))
+plot(colv)
+dend1 <- color_branches(colvDendr, k = 10, groupLabels = TRUE)
+plot(dend1, main = "default cuts by cutree")
+
+clusterME = cbind("Cluster" = cutree(colvDendr, k = 10))
+clusterME_meta = merge(MetaTrain, clusterME, by.x = 1, by.y = 0)
+table(clusterME_meta$Mesenchymal, clusterME_meta$Cluster)
+
+clusterME_meta$clusterClass = NA
+clusterME_meta$clusterClass[which(clusterME_meta$Cluster == 2)] = "Control"
+clusterME_meta$clusterClass[which(!clusterME_meta$Cluster == 2)] = "Mesenchymal"
+table(clusterME_meta$Mesenchymal, clusterME_meta$clusterClass)
+
+success = table(clusterME_meta$Mesenchymal, clusterME_meta$clusterClass)[1,1] +
+  table(clusterME_meta$Mesenchymal, clusterME_meta$clusterClass)[2,2]
+
+score_ME_All = success/sum(table(clusterME_meta$Mesenchymal, clusterME_meta$clusterClass))
+kappa_ME_All = cohen.kappa(x=cbind(clusterME_meta$Mesenchymal,clusterME_meta$clusterClass))
+
+# Heatmap Panel #
+centrME = read.table("Mesenchymal_centroids_DNAm.csv", sep=";", row.names=1)
+filt_centr_Me = filtered_clean_Me[which(colnames(filtered_clean_Me)%in%rownames(centrME))]
+colv = as.dendrogram(hclust(as.dist(1-cor(t(as.matrix(filt_centr_Me))))))
+rowv = as.dendrogram(hclust(as.dist(1-cor(as.matrix(filt_centr_Me)))))
+
+pdf("Heatmap_5_Probes_Mesenchymal_DNAm.pdf")
+heatmap.2(as.matrix(t(filt_centr_Me)), cexCol=0.7,
+          col = rev(redblue(256)), Rowv=rowv, Colv=colv, scale = "row", trace=NULL, tracecol=NULL, ColSideColors = filtered_metadata_Me$Color)
+legend('topleft', legend = unique(tumorLabels_Me), fill = unique(filtered_metadata_Me$Color), border=T, title='Subtype')
+dev.off()
+
+# Cut dendrogram and calculate percentage of "good calls" #
+colvDendr = hclust(as.dist(1-cor(as.matrix(t(filt_centr_Me)))))
+plot(colv)
+dend1 <- color_branches(colvDendr, k = 11, groupLabels = TRUE)
+plot(dend1, main = "default cuts by cutree")
+
+clusterME = cbind("Cluster" = cutree(colvDendr, k = 11))
+clusterME_meta = merge(MetaTrain, clusterME, by.x = 1, by.y = 0)
+table(clusterME_meta$Mesenchymal, clusterME_meta$Cluster)
+
+clusterME_meta$clusterClass = NA
+clusterME_meta$clusterClass[which(clusterME_meta$Cluster == 1)] = "Control"
+clusterME_meta$clusterClass[which(!clusterME_meta$Cluster == 1)] = "Mesenchymal"
+table(clusterME_meta$Mesenchymal, clusterME_meta$clusterClass)
+
+success = table(clusterME_meta$Mesenchymal, clusterME_meta$clusterClass)[1,1] +
+  table(clusterME_meta$Mesenchymal, clusterME_meta$clusterClass)[2,2]
+
+score_ME_Panel = success/sum(table(clusterME_meta$Mesenchymal, clusterME_meta$clusterClass))
+kappa_ME_Panel = cohen.kappa(x=cbind(clusterME_meta$Mesenchymal,clusterME_meta$clusterClass))
+scoreME = cbind("Score All" = score_ME_All, "Score Panel" = score_ME_Panel, "Kappa All" = kappa_ME_All$kappa, "Kappa Panel" = kappa_ME_Panel$kappa)
+
+write.table(scoreME, file = "DNAm - Score_hierarchical_clustering_Mesenchymal.csv", sep = ";")
+
+# t-SNE All DEG #
+Tsne = Rtsne(as.matrix(filtered_clean_Me),perplexity = 30, theta = 0, max_iter = 5000)
+
+pdf('tSNE_Mesenchymal_All_DEG.pdf')
+plot(Tsne$Y, main="t-SNE Mesenchymal vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Me], pch=19)
+legend('topleft', legend = unique(tumorLabels_Me), fill=plottingColors[unique(tumorLabels_Me)], border=T, title='Subtype')
+dev.off()
+
+# t-SNE Panel #
+Tsne = Rtsne(as.matrix(filt_centr_Me),perplexity = 30, theta = 0, max_iter = 5000)
+
+pdf('tSNE_5_Probes_Mesenchymal.pdf')
+plot(Tsne$Y, main="t-SNE Mesenchymal vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Me], pch=19)
+legend('topleft', legend = unique(tumorLabels_Me), fill=plottingColors[unique(tumorLabels_Me)], border=T, title='Subtype')
+dev.off()
+
+
+#### PRONEURAL ####
+Clin_pn = subset(MetaTrain, MetaTrain$Proneural=="Proneural")
+Clin_cont = subset(MetaTrain, MetaTrain$Proneural=="Control")
+barcodeME = Clin_pn$barcode
+barcodeCont = Clin_cont$barcode
+
+Met_Pn = GBM[which(rownames(GBM) %in% barcodeME),]
+Met_Pn_t = as.data.frame(as.matrix(t(Met_Pn)))
+
+Met_Cont = GBM[which(!rownames(GBM) %in% barcodeME),]
+Met_Cont_t = as.data.frame(as.matrix(t(Met_Cont)))
+
+PN.mean = apply(Met_Pn_t, 1, mean)
+CONTR.mean = apply(Met_Cont_t,1, mean)
+
+fold_Pn = (PN.mean-CONTR.mean)
+
+# Compute statistical significance #
+pvalue_Pn = NULL
+tstat_Pn = NULL
+for(i in 1 : nrow(Met_Pn_t)) {
+  x = Met_Pn_t[i,]
+  y = Met_Cont_t[i,]
+  
+  t = t.test(x, y) 
+  pvalue_Pn[i] = t$p.value
+  tstat_Pn[i] = t$statistic
+}
+
+qvalue_Pn = p.adjust(pvalue_Pn, method = "fdr", n = length(pvalue_Pn)) # Correction by False Discovery Rate
+combined_Pn = cbind(qvalue_Pn, fold_Pn, abs(fold_Pn), GBM_t)
+
+# Filter per Z-Ratio and qvalue #
+fold_cutoff = 1
+qvalue_cutoff = 0.05
+
+# fold-change filter for "biological" significance
+filter_by_fold_Pn = abs(fold_Pn) >= fold_cutoff
+dim(GBM_t[filter_by_fold_Pn, ]) 
+
+# P-value filter for "statistical" significance
+filter_by_qvalue_Pn = qvalue_Pn <= qvalue_cutoff
+dim(GBM_t[filter_by_qvalue_Pn, ]) 
+
+# Combined filter (both biological and statistical)
+filter_combined_Pn = filter_by_fold_Pn & filter_by_qvalue_Pn 
+
+filtered_Pn = GBM_t[filter_combined_Pn,]
+dim(filtered_Pn)
+filtered_combined_Pn = merge(combined_Pn, filtered_Pn, by=0)
+Probes_with_changes_Pn = filtered_combined_Pn[,1:4]
+UpProbes_Pn = Probes_with_changes_Pn$Row.names[which(Probes_with_changes_Pn$fold>0)]
+DownProbes_Pn = Probes_with_changes_Pn$Row.names[which(Probes_with_changes_Pn$fold<0)]
+write.table(Probes_with_changes_Pn, file = "DMS_Proneural.csv", sep = ";")
+
+# Create dataframe with Subtype data #
+tumorMetadata_Pn = cbind("barcode" = as.character(MetaTrain$barcode), "Proneural" = as.character(MetaTrain$Proneural))
+filtered_t_Pn = as.data.frame(as.matrix(t(filtered_Pn)))
+filtered_metadata_Pn = merge(tumorMetadata_Pn, filtered_t_Pn, by.x=1, by.y=0)
+rownames(filtered_metadata_Pn) = filtered_metadata_Pn[,1]
+names(filtered_metadata_Pn) = c(as.character(colnames(tumorMetadata_Pn)), as.character(colnames(filtered_t_Pn)))
+tumorLabels_Pn = as.character(filtered_metadata_Pn$Proneural)
+plottingColors = c("Red", "cadetblue")
+names(plottingColors) = unique(tumorLabels_Pn)
+
+filtered_metadata_t_Pn = as.data.frame(as.matrix(t(filtered_metadata_Pn)))
+filtered_clean_Pn = filtered_metadata_Pn[,-c(1,2)]
+filtered_clean_t_Pn = as.data.frame(as.matrix(t(filtered_clean_Pn)))
+
+
+# Use Random Forest and Nearest Shrunken Centroid to select the features for the panel #
+Pn_Probes = lapply(1:300,
+                   function(x){
+                     
+                     # Random Forest #
+                     RF_Pn = varSelRF(filtered_clean_Pn, as.factor(tumorLabels_Pn), c.sd = 2, mtryFactor = 1, ntree = 1000,
+                                      ntreeIterat = 500, vars.drop.num = NULL, vars.drop.frac = 0.2,
+                                      whole.range = TRUE, recompute.var.imp = TRUE, verbose = FALSE,
+                                      returnFirstForest = FALSE, fitted.rf = NULL, keep.forest = FALSE)
+                     
+                     sel_hist = RF_Pn$selec.history
+                     sel_hist=sel_hist[order(sel_hist$Number.Variables),]
+                     sel_hist=sel_hist[order(sel_hist$OOB),]
+                     sel_hist2=data.frame(x = sel_hist$Vars.in.Forest)
+                     All_variables = sel_hist2 %>% separate(x, as.character(1:ncol(filtered_clean_Pn)))
+                     sel_Probes = na.omit(as.factor(All_variables[1,]))
+                     sel_Probes = droplevels.factor(sel_Probes)
+                     RF_Probes = as.vector(sel_Probes)
+                     
+                     # Nearest Shrunken Centroid #
+                     filt100_t = subset(filtered_clean_t_Pn, rownames(filtered_clean_t_Pn)%in%RF_Probes)
+                     filt100 = as.data.frame(as.matrix(t(filt100_t)))
+                     subsetCentroid = as.data.frame(as.matrix(t(filt100)))
+                     
+                     data_All = list(x = as.matrix(subsetCentroid), y = as.vector(tumorLabels_Pn), 
+                                     geneid = rownames(subsetCentroid),
+                                     genenames = paste("g",as.character(1:nrow(subsetCentroid)),sep=""))
+                     
+                     training_All = pamr.train(data_All)
+                     valid_All = pamr.cv(training_All, data_All)
+                     valid_All
+                     Probes1 = pamr.listgenes(training_All, data_All, threshold = 0.5, fitcv=valid_All)
+                     Probes1Up = Probes1[,1][which(Probes1[,2]>0)]
+                     Probes1Down = Probes1[,1][which(Probes1[,2]<0)]
+                     selected_Probes = c(Probes1Up[1:2], Probes1Down[1:2], as.character(Probes1[,1]))
+                     selected_Probes = unique(selected_Probes)[1:5]
+                     
+                     print(x)
+                     
+                     selected_Probes
+                   })
+
+
+Pn_Probes_Sorted = lapply(1:300,
+                          function(k){
+                            sort(Pn_Probes[[k]])
+                          })  
+
+# Select the most repeated combination #
+n.obs = sapply(Pn_Probes_Sorted, length)
+seq.max = seq_len(max(n.obs))
+ClComb = as.data.frame(t(sapply(Pn_Probes_Sorted, "[", i = seq.max)))
+
+get_perm = function(v) {
+  m = permutations(n = length(v), r = length(v), v = v, set = F)
+  m[order(c(m))]
+}
+All = map(Pn_Probes_Sorted, get_perm)
+unique = map(Pn_Probes_Sorted, get_perm) %>% unique()
+res_vec = c()
+element = c()
+
+for(i in seq_along(unique)) {
+  element[[i]] = unique[[i]] %>% unique() %>% paste(collapse = ",")
+  res_vec[[i]] = All %in% unique[i] %>% sum()
+}
+
+repetitions_Pn = tibble(
+  elements = unlist(element),
+  numbers = res_vec
+)
+
+repeat1_Pn = repetitions_Pn[order(-as.numeric(repetitions_Pn$numbers)),]
+PNProbes = strsplit(as.character(repeat1_Pn[2,1]), ",") # Select the first one with 5 genes
+PNProbes = PNProbes[[1]]
+
+colorROC = rep(brewer.pal(n = 9, name = "YlOrRd"), 17)
+
+# Create centroids in groups of the same number of patients #
+pdf("ROC_Proneural_DNAm.pdf")
+Centr100_Pn = lapply(1:300,
+                     function(x){
+                       Clin_cl_t = as.data.frame(as.matrix(t(Clin_cl)))
+                       Clin_cl30 = as.data.frame(as.matrix(t(sample(Clin_cl_t, min(table(MetaTrain$subtype))))))
+                       Clin_me_t = as.data.frame(as.matrix(t(Clin_me)))
+                       Clin_me30 = as.data.frame(as.matrix(t(sample(Clin_me_t, min(table(MetaTrain$subtype))))))
+                       Clin_pn_t = as.data.frame(as.matrix(t(Clin_pn)))
+                       Clin_pn30 = as.data.frame(as.matrix(t(sample(Clin_pn_t, min(table(MetaTrain$subtype))))))
+                       Clin = rbind(Clin_cl30, Clin_me30, Clin_pn30)
+                       
+                       GBM = subset(GBMAll_t, rownames(GBMAll_t)%in%Clin$barcode)
+                       GBM_t = as.data.frame(as.matrix(t(GBM)))
+                       barcode = rownames(GBM)
+                       
+                       tumorMetadata_Pn = cbind("barcode" = as.character(Clin$barcode), "Proneural" = as.character(Clin$Proneural))
+                       filtered_t_Pn = GBM[,which(colnames(GBM)%in%PNProbes)]
+                       filtered_metadata_Pn = merge(tumorMetadata_Pn, filtered_t_Pn, by.x=1, by.y=0)
+                       names(filtered_metadata_Pn) = c(as.character(colnames(tumorMetadata_Pn)), as.character(colnames(filtered_t_Pn)))
+                       tumorLabels_Pn = as.character(filtered_metadata_Pn$Proneural)
+                       plottingColors = c("Red", "cadetblue")
+                       names(plottingColors) = unique(tumorLabels_Pn)
+                       
+                       filtered_metadata_t_Pn = as.data.frame(as.matrix(t(filtered_metadata_Pn)))
+                       filtered_clean_Pn = filtered_metadata_Pn[,-c(1,2)]
+                       filtered_clean_t_Pn = as.data.frame(as.matrix(t(filtered_clean_Pn)))
+                       
+                       data_All = list(x = as.matrix(filtered_clean_t_Pn), y = as.vector(tumorLabels_Pn), 
+                                       geneid = rownames(filtered_clean_t_Pn),
+                                       genenames = paste("g",as.character(1:nrow(filtered_clean_t_Pn)),sep=""))
+                       
+                       training_All = pamr.train(data_All, threshold = 0)
+                       valid_All = pamr.cv(training_All, data_All)
+                       valid_prob_Best1 = as.data.frame(valid_All$prob)
+                       scores_Best1=valid_prob_Best1[,2]
+                       ROCR.simple_Best1 = list(predictions=scores_Best1, labels=tumorLabels_Pn)
+                       pred_Best1 = prediction(ROCR.simple_Best1$predictions, ROCR.simple_Best1$labels)
+                       perf_Best1 = performance(pred_Best1,"tpr","fpr")
+                       perfAUC_Best1 = performance(pred_Best1,"tpr","fpr", measure="auc")
+                       AUC_Col = as.data.frame(cbind(perfAUC_Best1@y.values))
+                       AUC_Col$Col = NA
+                       AUC_Col$Col[which(AUC_Col > 0.7)] = colorROC[1]
+                       AUC_Col$Col[which(AUC_Col > 0.8)] = colorROC[2]
+                       AUC_Col$Col[which(AUC_Col > 0.825)] = colorROC[3]
+                       AUC_Col$Col[which(AUC_Col > 0.85)] = colorROC[4]
+                       AUC_Col$Col[which(AUC_Col > 0.875)] = colorROC[5]
+                       AUC_Col$Col[which(AUC_Col > 0.9)] = colorROC[6]
+                       AUC_Col$Col[which(AUC_Col > 0.925)] = colorROC[7]
+                       AUC_Col$Col[which(AUC_Col > 0.95)] = colorROC[8]
+                       AUC_Col$Col[which(AUC_Col > 0.975)] = colorROC[9]
+                       plot(perf_Best1, col = AUC_Col$Col, xlim=c(0,1), ylim=c(0,1), lwd = 2)
+                       par(new=TRUE)
+                       
+                       list(PNProbes, valid_All$error, training_All$centroids, training_All$sd, valid_All, perfAUC_Best1@y.values)               
+                     })
+dev.off()
+par(new = FALSE)
+
+# Obtain centroids #
+centrList_Pn = sapply(1:length(Centr100_Pn),
+                      function(x){
+                        list(Centr100_Pn[[x]][[3]])
+                      })
+centrPN = Reduce("+", centrList_Pn)/length(Centr100_Pn)
+
+SDListPN = sapply(1:length(Centr100_Pn),
+                  function(x){
+                    list(Centr100_Pn[[x]][[4]])
+                  })
+
+PNSD = Reduce("+", SDListPN)/length(Centr100_Pn)
+
+error_Pn = sapply(1:length(Centr100_Pn),
+                  function(x){
+                    list(Centr100_Pn[[x]][[2]])
+                  })
+write.table(error_Pn, file="Error_rate_Proneural_DNAm.csv", sep=";")
+
+AUC_Pn = sapply(1:length(Centr100_Pn),
+                function(x){
+                  list(Centr100_Pn[[x]][[6]][[1]])
+                })
+write.table(AUC_Pn, file="AUC_Proneural_DNAm.csv", sep=";")
+
+# "Synthetic" Centroid #
+centrPN = cbind(centrPN, centrPN[,1]+0.0000001, centrPN[,2]+0.0000001, centrPN[,1]-0.0000001, centrPN[,2]-0.0000001) # Add more than one column to the centroid, and then we will add the SD manuAlly
+write.table(PNSD, file="Proneural_SD_DNAm.csv", sep=";")
+write.table(centrPN, file="Proneural_centroids_DNAm.csv", sep=";")
+
+
+# Figures #
+# Volcano Plot #
+pdf("Volcano_Plot_Proneural_DNAm.pdf")
+plot(fold_Pn, -log10(qvalue_Pn), main = "Proneural vs Control - Volcano", xlim=c(-4, 4), ylim=c(0,12), xlab="fold")
+points (fold_Pn[filter_combined_Pn & fold_Pn > 0],
+        -log10(qvalue_Pn[filter_combined_Pn & fold_Pn > 0]),
+        pch = 16, col = "red")
+points (fold_Pn[filter_combined_Pn & fold_Pn < 0],
+        -log10(qvalue_Pn[filter_combined_Pn & fold_Pn < 0]),
+        pch = 16, col = "blue")
+
+abline(v = fold_cutoff, col = "red", lwd = 3)
+abline(v = -fold_cutoff, col = "blue", lwd = 3)
+abline(h = -log10(qvalue_cutoff), col = "grey", lwd = 3)
+dev.off()
+
+# Heatmap All DEG #
+filtered_metadata_Pn$Color[filtered_metadata_Pn$Proneural=="Proneural"]="red"
+filtered_metadata_Pn$Color[filtered_metadata_Pn$Proneural=="Control"] = "yellow"
+colv = as.dendrogram(hclust(as.dist(1-cor(t(as.matrix(filtered_clean_Pn))))))
+rowv = as.dendrogram(hclust(as.dist(1-cor(as.matrix(filtered_clean_Pn)))))
+
+pdf("Heatmap_All_DEG_Proneural_DNAm.pdf")
+heatmap.2(as.matrix(t(filtered_clean_Pn)), cexCol=0.7,
+          col = rev(redblue(256)), Rowv=rowv, Colv=colv, scale = "row", trace=NULL, tracecol=NULL, ColSideColors = filtered_metadata_Pn$Color)
+legend('topleft', legend = unique(tumorLabels_Pn), fill = unique(filtered_metadata_Pn$Color), border=T, title='Subtype')
+dev.off()
+
+# Cut dendrogram and calculate percentage of "good calls" #
+colvDendr = hclust(as.dist(1-cor(as.matrix(t(filtered_clean_Pn)))))
+plot(colv)
+dend1 <- color_branches(colvDendr, k = 3, groupLabels = TRUE)
+plot(dend1, main = "default cuts by cutree")
+
+clusterPN = cbind("Cluster" = cutree(colvDendr, k = 3))
+clusterPN_meta = merge(MetaTrain, clusterPN, by.x = 1, by.y = 0)
+table(clusterPN_meta$Proneural, clusterPN_meta$Cluster)
+
+clusterPN_meta$clusterClass = NA
+clusterPN_meta$clusterClass[which(!clusterPN_meta$Cluster == 2)] = "Control"
+clusterPN_meta$clusterClass[which(clusterPN_meta$Cluster == 2)] = "Proneural"
+table(clusterPN_meta$Proneural, clusterPN_meta$clusterClass)
+
+success = table(clusterPN_meta$Proneural, clusterPN_meta$clusterClass)[1,1] +
+  table(clusterPN_meta$Proneural, clusterPN_meta$clusterClass)[2,2]
+
+score_PN_All = success/sum(table(clusterPN_meta$Proneural, clusterPN_meta$clusterClass))
+kappa_PN_All = cohen.kappa(x=cbind(clusterPN_meta$Proneural,clusterPN_meta$clusterClass))
+
+# Heatmap Panel #
+centrPN = read.table("Proneural_centroids_DNAm.csv", sep=";", row.names=1)
+filt_centr_Pn = filtered_clean_Pn[which(colnames(filtered_clean_Pn)%in%rownames(centrPN))]
+colv = as.dendrogram(hclust(as.dist(1-cor(t(as.matrix(filt_centr_Pn))))))
+rowv = as.dendrogram(hclust(as.dist(1-cor(as.matrix(filt_centr_Pn)))))
+
+pdf("Heatmap_5_Probes_Proneural_DNAm.pdf")
+heatmap.2(as.matrix(t(filt_centr_Pn)), cexCol=0.7,
+          col = rev(redblue(256)), Rowv=rowv, Colv=colv, scale = "row", trace=NULL, tracecol=NULL, ColSideColors = filtered_metadata_Pn$Color)
+legend('topleft', legend = unique(tumorLabels_Pn), fill = unique(filtered_metadata_Pn$Color), border=T, title='Subtype')
+dev.off()
+
+# Cut dendrogram and calculate percentage of "good calls" #
+colvDendr = hclust(as.dist(1-cor(as.matrix(t(filt_centr_Pn)))))
+plot(colv)
+dend1 <- color_labels(colvDendr, k = 2)
+plot(dend1, main = "default cuts by cutree")
+
+clusterPN = cbind("Cluster" = cutree(colvDendr, k = 2))
+clusterPN_meta = merge(MetaTrain, clusterPN, by.x = 1, by.y = 0)
+table(clusterPN_meta$Proneural, clusterPN_meta$Cluster)
+
+clusterPN_meta$clusterClass = NA
+clusterPN_meta$clusterClass[which(!clusterPN_meta$Cluster == 2)] = "Control"
+clusterPN_meta$clusterClass[which(clusterPN_meta$Cluster == 2)] = "Proneural"
+table(clusterPN_meta$Proneural, clusterPN_meta$clusterClass)
+
+success = table(clusterPN_meta$Proneural, clusterPN_meta$clusterClass)[1,1] +
+  table(clusterPN_meta$Proneural, clusterPN_meta$clusterClass)[2,2]
+
+score_PN_Panel = success/sum(table(clusterPN_meta$Proneural, clusterPN_meta$clusterClass))
+kappa_PN_Panel = cohen.kappa(x=cbind(clusterPN_meta$Proneural,clusterPN_meta$clusterClass))
+scorePN = cbind("Score All" = score_PN_All, "Score Panel" = score_PN_Panel, "Kappa All" = kappa_PN_All$kappa, "Kappa Panel" = kappa_PN_Panel$kappa)
+
+write.table(scorePN, file = "DNAm - Score_hierarchical_clustering_Proneural.csv", sep = ";")
+
+# t-SNE All DEG #
+Tsne = Rtsne(as.matrix(filtered_clean_Pn),perplexity = 30, theta = 0, max_iter = 5000)
+
+pdf('tSNE_Proneural_All_DEG.pdf')
+plot(Tsne$Y, main="t-SNE Proneural vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Pn], pch=19)
+legend('topleft', legend = unique(tumorLabels_Pn), fill=plottingColors[unique(tumorLabels_Pn)], border=T, title='Subtype')
+dev.off()
+
+# t-SNE Panel #
+Tsne = Rtsne(as.matrix(filt_centr_Pn),perplexity = 30, theta = 0, max_iter = 5000)
+
+pdf('tSNE_5_Probes_Proneural.pdf')
+plot(Tsne$Y, main="t-SNE Proneural vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Pn], pch=19)
+legend('topleft', legend = unique(tumorLabels_Pn), fill=plottingColors[unique(tumorLabels_Pn)], border=T, title='Subtype')
+dev.off()
+
+
+#### VALIDATION ####
+GBM_val = GBMAll[which(colnames(GBMAll)%in%MetaVal$barcode)]
+GBM_val_t=as.data.frame(as.matrix(t(GBM_val)))
+
+#### Classical ####
+centrCL = read.table("Classical_centroids_DNAm.csv", sep=";", header=TRUE, row.names=1)
+centrCL = centrCL[order(rownames(centrCL)),]
+CLSD = read.table("Classical_SD_DNAm.csv", sep=";")
+CLSD = CLSD[order(rownames(CLSD)),]
+data_centrCL = list(x = as.matrix(centrCL), y = as.vector(c("Classical", "Control", "Classical", "Control", "Classical", "Control")), geneid = rownames(centrCL),genenames = paste("g",as.character(1:nrow(centrCL)),sep=""))
+train_centrCL = pamr.train(data_centrCL, threshold = 0)
+train_centrCL$sd = CLSD
+
+# Predict subtype classical
+GBM_val_cl = GBM_val[which(rownames(GBM_val)%in%rownames(centrCL)),]
+prediction_0_cl = pamr.predict(train_centrCL, GBM_val_cl, threshold = 0,
+                               type = c("posterior"))
+
+#### Mesenchymal ####
+centrME = read.table("Mesenchymal_centroids_DNAm.csv", sep=";", header=TRUE, row.names=1)
+centrME = centrME[order(rownames(centrME)),]
+MESD = read.table("Mesenchymal_SD_DNAm.csv", sep=";")
+MESD = MESD[order(rownames(MESD)),]
+data_centrME = list(x = as.matrix(centrME), y = as.vector(c("Control", "Mesenchymal", "Control", "Mesenchymal", "Control", "Mesenchymal")), geneid = rownames(centrME),genenames = paste("g",as.character(1:nrow(centrME)),sep=""))
+train_centrME = pamr.train(data_centrME, threshold = 0)
+train_centrME$sd = MESD
+
+# Predict subtype Mesenchymal
+GBM_val_me = GBM_val[which(rownames(GBM_val)%in%rownames(centrME)),]
+prediction_0_me = pamr.predict(train_centrME, GBM_val_me, threshold = 0,
+                               type = c("posterior"))
+
+CL_ME = merge(prediction_0_cl, prediction_0_me, by=0)
+rownames(CL_ME) = CL_ME[,1]
+CL_ME = CL_ME[,-c(1,3,4)]
+
+#### Proneural ####
+centrPN = read.table("Proneural_centroids_DNAm.csv", sep=";", header=TRUE, row.names=1)
+centrPN = centrPN[order(rownames(centrPN)),]
+PNSD = read.table("Proneural_SD_DNAm.csv", sep=";")
+PNSD = PNSD[order(rownames(PNSD)),]
+data_centrPN = list(x = as.matrix(centrPN), y = as.vector(c("Control", "Proneural", "Control", "Proneural", "Control", "Proneural")), geneid = rownames(centrPN),genenames = paste("g",as.character(1:nrow(centrPN)),sep=""))
+train_centrPN = pamr.train(data_centrPN, threshold = 0)
+valid_centrPN = pamr.cv(train_centrPN, data_centrPN)
+train_centrPN$sd = PNSD
+
+# Predict subtype Proneural
+GBM_val_pn = GBM_val[which(rownames(GBM_val)%in%rownames(centrPN)),]
+prediction_0_pn = pamr.predict(train_centrPN, GBM_val_pn, threshold = 0,
+                               type = c("posterior"))
+
+All = merge(CL_ME, prediction_0_pn, by=0)
+rownames(All)=All[,1]
+All = All[,-c(1,4)]
+All_class = merge(All, MetaVal, by.x=0, by.y=1)
+rownames(All_class)=All_class[,1]
+All_class = All_class[,c(2,3,4,5)]
+write.table(All_class, file="DNAm_Validation_Classified_by_Centroids.csv", sep=";")
+
+
+#### INTEGRATIVE ####
+setwd("D:/R/GBM-LGG/GBM Subtypes") # Initial folder where we have the Gene Expression results
+ClinAll = read.csv("Clinical_Data_TCGA.csv", sep=";", header=TRUE) # Clinical Data downlaoded from cBioPortal and curated in Excel
+GeneExp = read.table("GBM_u133.txt", sep="\t", header=TRUE, row.names=1) # Downloaded from Firehose
+colnames(GeneExp)=substr(colnames(GeneExp), 1, 12)
+GeneExp = GeneExp[-1,]
+DNAm=read.table("Methylation_27_450_GEO.csv", sep=";", row.names=1, header=TRUE)
+DNAm = log2(DNAm/(1-DNAm)) 
+barcode = read.table("Barcodes_27_450_GEO.csv", sep=";", header = TRUE) # Excel file that we have created containing barcode and "batch" of each patient in this new cohort (it will be different for each person since it depends on random sampling)
+colnames(DNAm) = barcode$Barcode # Only to remove the "prefix"
+
+setwd("D:/R/GBM-LGG/GBM Subtypes/DNAm") # Folder with DNAm results
+barcTrain = read.table("Training_Barcodes.csv", sep = ";")[,1]
+GeneExp = GeneExp[,which(colnames(GeneExp)%in%barcTrain)]
+GeneExp = data.frame(apply(GeneExp, 2, function(x) as.numeric(as.character(x))), row.names = rownames(GeneExp))
+GeneExp_t = as.data.frame(as.matrix(t(GeneExp)))
+
+DNAm = DNAm[,which(colnames(DNAm)%in%colnames(GeneExp))]
+DNAm = data.frame(apply(DNAm, 2, function(x) as.numeric(as.character(x))), row.names = rownames(DNAm))
+DNAm_t = as.data.frame(as.matrix(t(DNAm)))
+
+ClinAll = ClinAll[which(ClinAll$Patient.ID %in% rownames(DNAm_t)),]
+Clin_cl = ClinAll[which(ClinAll$Calculated.subtype == "Classical"),]
+Clin_me = ClinAll[which(ClinAll$Calculated.subtype == "Mesenchymal"),]
+Clin_pn = ClinAll[which(ClinAll$Calculated.subtype == "Proneural"),]
+
+# Load GeneExp centroids #
+setwd("D:/R/GBM-LGG/GBM Subtypes")
+centrCLGE=read.table("Classical_centroids_GeneExp.csv", sep=";", header=TRUE, row.names=1)
+CLGenes = rownames(centrCLGE)
+
+centrMEGE=read.table("Mesenchymal_centroids_GeneExp.csv", sep=";", header=TRUE, row.names=1)
+MEGenes = rownames(centrMEGE)
+
+centrPNGE=read.table("Proneural_centroids_GeneExp.csv", sep=";", header=TRUE, row.names=1)
+PNGenes = rownames(centrPNGE)
+
+# Load DNAm centroids #
+setwd("D:/R/GBM-LGG/GBM Subtypes/DNAm")
+centrCLDNAm=read.table("Classical_centroids_DNAm.csv", sep=";", header=TRUE, row.names=1)
+CLProbes = rownames(centrCLDNAm)
+
+centrMEDNAm=read.table("Mesenchymal_centroids_DNAm.csv", sep=";", header=TRUE, row.names=1)
+MEProbes = rownames(centrMEDNAm)
+
+centrPNDNAm=read.table("Proneural_centroids_DNAm.csv", sep=";", header=TRUE, row.names=1)
+PNProbes = rownames(centrPNDNAm)
+
+setwd("D:/R/GBM-LGG/GBM Subtypes/Integrative") # New folder for Integrative results
+
+# Filter by genes/probes in centroids #
+MetGen = merge(GeneExp_t, DNAm_t, by = 0)
+rownames(MetGen) = MetGen[,1]
+MetGen = MetGen[,-1]
+Filt = MetGen[which(colnames(MetGen) %in% CLGenes | colnames(MetGen) %in% MEGenes | colnames(MetGen) %in% PNGenes |
+                      colnames(MetGen) %in% CLProbes | colnames(MetGen) %in% MEProbes | colnames(MetGen) %in% PNProbes)]
+
+#### Classical ####
+# Create centroids in groups of 50 patients #
+colorROC = rep(brewer.pal(n = 9, name = "YlOrRd"), 17)
+
+pdf("ROC_Classical_Integrative.pdf")
+Centr100_Cl = lapply(1:300,
+                     function(x){
+                       Clin_cl_t = as.data.frame(as.matrix(t(Clin_cl)))
+                       Clin_cl30 = as.data.frame(as.matrix(t(sample(Clin_cl_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin_me_t = as.data.frame(as.matrix(t(Clin_me)))
+                       Clin_me30 = as.data.frame(as.matrix(t(sample(Clin_me_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin_pn_t = as.data.frame(as.matrix(t(Clin_pn)))
+                       Clin_pn30 = as.data.frame(as.matrix(t(sample(Clin_pn_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin = rbind(Clin_cl30, Clin_me30, Clin_pn30)
+                       
+                       
+                       FiltGE = GeneExp_t[which(rownames(GeneExp_t) %in% Clin$Patient.ID),]
+                       FiltGE = FiltGE[,which(colnames(FiltGE) %in% CLGenes)]
+                       FiltGE = scale(FiltGE)
+                       
+                       FiltMet = DNAm_t[which(rownames(DNAm_t) %in% Clin$Patient.ID),]
+                       FiltMet = FiltMet[,which(colnames(FiltMet) %in% CLProbes)]
+                       
+                       
+                       MetGen = merge(FiltGE, FiltMet, by = 0)
+                       rownames(MetGen) = MetGen[,1]
+                       MetGen = MetGen[,-1]
+                       
+                       MetGen90 = MetGen[which(rownames(MetGen) %in% Clin$Patient.ID),]
+                       GBM_t = as.data.frame(as.matrix(t(MetGen90)))
+                       
+                       tumorMetadata_Cl = cbind("Patient.ID" = as.character(Clin$Patient.ID), "Classical" = as.character(Clin$Classical))
+                       filtered_t_Cl = MetGen90[,which(colnames(MetGen90)%in%CLGenes | colnames(MetGen90) %in% CLProbes)]
+                       filtered_metadata_Cl = merge(tumorMetadata_Cl, filtered_t_Cl, by.x=1, by.y=0)
+                       names(filtered_metadata_Cl) = c(as.character(colnames(tumorMetadata_Cl)), as.character(colnames(filtered_t_Cl)))
+                       tumorLabels_Cl = as.character(filtered_metadata_Cl$Classical)
+                       
+                       filtered_metadata_t_Cl = as.data.frame(as.matrix(t(filtered_metadata_Cl)))
+                       filtered_clean_Cl = filtered_metadata_Cl[,-c(1,2)]
+                       filtered_clean_t_Cl = as.data.frame(as.matrix(t(filtered_clean_Cl)))
+                       
+                       
+                       data_All = list(x = as.matrix(filtered_clean_t_Cl), y = as.vector(tumorLabels_Cl), 
+                                       geneid = rownames(filtered_clean_t_Cl),
+                                       genenames = paste("g",as.character(1:nrow(filtered_clean_t_Cl)),sep=""))
+                       
+                       training_All = pamr.train(data_All, threshold = 0)
+                       valid_All = pamr.cv(training_All, data_All)
+                       valid_prob_Best1 = as.data.frame(valid_All$prob)
+                       scores_Best1=valid_prob_Best1[,2]
+                       ROCR.simple_Best1 = list(predictions=scores_Best1, labels=tumorLabels_Cl)
+                       pred_Best1 = prediction(ROCR.simple_Best1$predictions, ROCR.simple_Best1$labels)
+                       perf_Best1 = performance(pred_Best1,"tpr","fpr")
+                       perfAUC_Best1 = performance(pred_Best1,"tpr","fpr", measure="auc")
+                       
+                       AUC_Col = as.data.frame(cbind(perfAUC_Best1@y.values))
+                       AUC_Col$Col = NA
+                       AUC_Col$Col[which(AUC_Col > 0.7)] = colorROC[1]
+                       AUC_Col$Col[which(AUC_Col > 0.8)] = colorROC[2]
+                       AUC_Col$Col[which(AUC_Col > 0.825)] = colorROC[3]
+                       AUC_Col$Col[which(AUC_Col > 0.85)] = colorROC[4]
+                       AUC_Col$Col[which(AUC_Col > 0.875)] = colorROC[5]
+                       AUC_Col$Col[which(AUC_Col > 0.9)] = colorROC[6]
+                       AUC_Col$Col[which(AUC_Col > 0.925)] = colorROC[7]
+                       AUC_Col$Col[which(AUC_Col > 0.95)] = colorROC[8]
+                       AUC_Col$Col[which(AUC_Col > 0.975)] = colorROC[9]
+                       plot(perf_Best1, col = AUC_Col$Col, xlim=c(0,1), ylim=c(0,1), lwd = 2)
+                       par(new=TRUE)
+                       list(CLGenes, valid_All$error, training_All$centroids, training_All$sd, valid_All, perfAUC_Best1@y.values)               
+                     })
+dev.off()
+par(new=FALSE)
+
+# Obtain centroids #
+centrList_Cl = sapply(1:length(Centr100_Cl),
+                      function(x){
+                        list(Centr100_Cl[[x]][[3]])
+                      })
+centrCL = Reduce("+", centrList_Cl)/length(Centr100_Cl)
+
+SDListCL = sapply(1:length(Centr100_Cl),
+                  function(x){
+                    list(Centr100_Cl[[x]][[4]])
+                  })
+
+CLSD = Reduce("+", SDListCL)/length(Centr100_Cl)
+
+error_Cl = sapply(1:length(Centr100_Cl),
+                  function(x){
+                    list(Centr100_Cl[[x]][[2]])
+                  })
+write.table(error_Cl, file="Integrative - Error_rate_Classical.csv", sep=";")
+
+AUC_Cl = sapply(1:length(Centr100_Cl),
+                function(x){
+                  list(Centr100_Cl[[x]][[6]][[1]])
+                })
+write.table(AUC_Cl, file="Integrative - AUC_Classical.csv", sep=";")
+
+# "Synthetic" Centroid #
+centrCL = cbind(centrCL, centrCL[,1]+0.0000001, centrCL[,2]+0.0000001, centrCL[,1]-0.0000001, centrCL[,2]-0.0000001) # Add more than one column to the centroid, and then we will add the SD manuAlly
+write.table(CLSD, file="Integrative - Classical_SD.csv", sep=";")
+write.table(centrCL, file="Integrative - Classical_centroids.csv", sep=";")
+
+
+#### Figures Classical ####
+setwd("D:/R/GBM-LGG/GBM Subtypes")
+GE_genes = read.table("DEG_Classical.csv", sep = ";")
+setwd("D:/R/GBM-LGG/GBM Subtypes/DNAm")
+DNAm_probes = read.table("DMS_Classical.csv", sep = ";")
+setwd("D:/R/GBM-LGG/GBM Subtypes/Integrative")
+
+filtered_Cl = MetGen[which(colnames(MetGen) %in% GE_genes$Row.names | colnames(MetGen) %in% DNAm_probes$Row.names)]
+
+tumorMetadata_Cl = cbind("barcode" = as.character(ClinAll$Patient.ID), "Classical" = as.character(ClinAll$Classical))
+filtered_t_Cl = as.data.frame(as.matrix(t(filtered_Cl)))
+filtered_metadata_Cl = merge(tumorMetadata_Cl, filtered_Cl, by.x=1, by.y=0)
+rownames(filtered_metadata_Cl) = filtered_metadata_Cl[,1]
+names(filtered_metadata_Cl) = c(as.character(colnames(tumorMetadata_Cl)), as.character(colnames(filtered_t_Cl)))
+tumorLabels_Cl = as.character(filtered_metadata_Cl$Classical)
+plottingColors = c("Red", "cadetblue")
+names(plottingColors) = unique(tumorLabels_Cl)
+
+# t-SNE All DEG #
+Tsne = Rtsne(as.matrix(filtered_Cl),perplexity = 30, theta = 0, max_iter = 5000)
+
+pdf('Integrative - tSNE_Classical_All_DEG.pdf')
+plot(Tsne$Y, main="t-SNE Classical vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Cl], pch=19)
+legend('topleft', legend = unique(tumorLabels_Cl), fill=plottingColors[unique(tumorLabels_Cl)], border=T, title='Subtype')
+dev.off()
+
+# t-SNE Panel #
+
+filt_centr_Cl = MetGen[which(colnames(MetGen) %in% CLProbes | colnames(MetGen) %in% CLGenes)]
+
+Tsne = Rtsne(as.matrix(filt_centr_Cl),perplexity = 30, theta = 0, max_iter = 5000)
+
+pdf('Integrative - tSNE_5_Probes_Classical.pdf')
+plot(Tsne$Y, main="t-SNE Classical vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Cl], pch=19)
+legend('topleft', legend = unique(tumorLabels_Cl), fill=plottingColors[unique(tumorLabels_Cl)], border=T, title='Subtype')
+dev.off()
+
+
+#### Mesenchymal ####
+colorROC = rep(brewer.pal(n = 9, name = "YlOrRd"), 17)
+
+pdf("ROC_Mesenchymal_Integrative - 2.pdf")
+Centr100_me = lapply(1:300,
+                     function(x){
+                       Clin_cl_t = as.data.frame(as.matrix(t(Clin_cl)))
+                       Clin_cl30 = as.data.frame(as.matrix(t(sample(Clin_cl_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin_me_t = as.data.frame(as.matrix(t(Clin_me)))
+                       Clin_me30 = as.data.frame(as.matrix(t(sample(Clin_me_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin_pn_t = as.data.frame(as.matrix(t(Clin_pn)))
+                       Clin_pn30 = as.data.frame(as.matrix(t(sample(Clin_pn_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin = rbind(Clin_cl30, Clin_me30, Clin_pn30)
+                       
+                       FiltGE = GeneExp_t[which(rownames(GeneExp_t) %in% Clin$Patient.ID),]
+                       FiltGE = FiltGE[,which(colnames(FiltGE) %in% MEGenes)]
+                       FiltGE = scale(FiltGE)
+                       
+                       FiltMet = DNAm_t[which(rownames(DNAm_t) %in% Clin$Patient.ID),]
+                       FiltMet = FiltMet[,which(colnames(FiltMet) %in% MEProbes)]
+                       
+                       
+                       MetGen = merge(FiltGE, FiltMet, by = 0)
+                       rownames(MetGen) = MetGen[,1]
+                       MetGen = MetGen[,-1]
+                       
+                       MetGen90 = MetGen[which(rownames(MetGen) %in% Clin$Patient.ID),]
+                       GBM_t = as.data.frame(as.matrix(t(MetGen90)))
+                       
+                       tumorMetadata_me = cbind("Patient.ID" = as.character(Clin$Patient.ID), "Mesenchymal" = as.character(Clin$Mesenchymal))
+                       filtered_t_me = MetGen90[,which(colnames(MetGen90)%in%MEGenes | colnames(MetGen90) %in% MEProbes)]
+                       filtered_metadata_me = merge(tumorMetadata_me, filtered_t_me, by.x=1, by.y=0)
+                       names(filtered_metadata_me) = c(as.character(colnames(tumorMetadata_me)), as.character(colnames(filtered_t_me)))
+                       tumorLabels_me = as.character(filtered_metadata_me$Mesenchymal)
+                       plottingColors = c("Red", "cadetblue")
+                       names(plottingColors) = unique(tumorLabels_me)
+                       
+                       filtered_metadata_t_me = as.data.frame(as.matrix(t(filtered_metadata_me)))
+                       filtered_meean_me = filtered_metadata_me[,-c(1,2)]
+                       filtered_meean_t_me = as.data.frame(as.matrix(t(filtered_meean_me)))
+                       
+                       
+                       data_All = list(x = as.matrix(filtered_meean_t_me), y = as.vector(tumorLabels_me), 
+                                       geneid = rownames(filtered_meean_t_me),
+                                       genenames = paste("g",as.character(1:nrow(filtered_meean_t_me)),sep=""))
+                       
+                       training_All = pamr.train(data_All, threshold = 0)
+                       valid_All = pamr.cv(training_All, data_All)
+                       valid_prob_Best1 = as.data.frame(valid_All$prob)
+                       scores_Best1=valid_prob_Best1[,2]
+                       ROCR.simple_Best1 = list(predictions=scores_Best1, labels=tumorLabels_me)
+                       pred_Best1 = prediction(ROCR.simple_Best1$predictions, ROCR.simple_Best1$labels)
+                       perf_Best1 = performance(pred_Best1,"tpr","fpr")
+                       perfAUC_Best1 = performance(pred_Best1,"tpr","fpr", measure="auc")
+                       
+                       AUC_Col = as.data.frame(cbind(perfAUC_Best1@y.values))
+                       AUC_Col$Col = NA
+                       AUC_Col$Col[which(AUC_Col > 0.7)] = colorROC[1]
+                       AUC_Col$Col[which(AUC_Col > 0.8)] = colorROC[2]
+                       AUC_Col$Col[which(AUC_Col > 0.825)] = colorROC[3]
+                       AUC_Col$Col[which(AUC_Col > 0.85)] = colorROC[4]
+                       AUC_Col$Col[which(AUC_Col > 0.875)] = colorROC[5]
+                       AUC_Col$Col[which(AUC_Col > 0.9)] = colorROC[6]
+                       AUC_Col$Col[which(AUC_Col > 0.925)] = colorROC[7]
+                       AUC_Col$Col[which(AUC_Col > 0.95)] = colorROC[8]
+                       AUC_Col$Col[which(AUC_Col > 0.975)] = colorROC[9]
+                       plot(perf_Best1, col = AUC_Col$Col, xlim=c(0,1), ylim=c(0,1), lwd = 2)
+                       par(new=TRUE)
+                       list(MEGenes, valid_All$error, training_All$centroids, training_All$sd, valid_All, perfAUC_Best1@y.values)               
+                     })
+dev.off()
+par(new=FALSE)
+
+# Obtain centroids #
+centrList_me = sapply(1:length(Centr100_Me),
+                      function(x){
+                        list(Centr100_Me[[x]][[3]])
+                      })
+centrCL = Reduce("+", centrList_me)/length(Centr100_Me)
+
+SDListCL = sapply(1:length(Centr100_Me),
+                  function(x){
+                    list(Centr100_Me[[x]][[4]])
+                  })
+
+MESD = Reduce("+", SDListCL)/length(Centr100_Me)
+
+error_me = sapply(1:length(Centr100_Me),
+                  function(x){
+                    list(Centr100_Me[[x]][[2]])
+                  })
+write.table(error_me, file="Integrative - Error_rate_Mesenchymal.csv", sep=";")
+
+AUC_me = sapply(1:length(Centr100_Me),
+                function(x){
+                  list(Centr100_Me[[x]][[6]][[1]])
+                })
+mean(unlist(AUC_me))
+write.table(AUC_me, file="Integrative - AUC_Mesenchymal.csv", sep=";")
+
+# "Synthetic" Centroid #
+centrME = cbind(centrCL, centrCL[,1]+0.0000001, centrCL[,2]+0.0000001, centrCL[,1]-0.0000001, centrCL[,2]-0.0000001) # Add more than one column to the centroid, and then we will add the SD manuAlly
+write.table(MESD, file="Integrative - Mesenchymal_SD.csv", sep=";")
+write.table(centrME, file="Integrative - Mesenchymal_centroids.csv", sep=";")
+
+#### Figures Mesenchymal ####
+setwd("D:/R/GBM-LGG/GBM Subtypes")
+GE_genes = read.table("DEG_Mesenchymal.csv", sep = ";")
+setwd("D:/R/GBM-LGG/GBM Subtypes/DNAm")
+DNAm_probes = read.table("DMS_Mesenchymal.csv", sep = ";")
+setwd("D:/R/GBM-LGG/GBM Subtypes/Integrative")
+
+filtered_Me = MetGen[which(colnames(MetGen) %in% GE_genes$Row.names | colnames(MetGen) %in% DNAm_probes$Row.names)]
+
+tumorMetadata_Me = cbind("barcode" = as.character(ClinAll$Patient.ID), "Mesenchymal" = as.character(ClinAll$Mesenchymal))
+filtered_t_Me = as.data.frame(as.matrix(t(filtered_Me)))
+filtered_metadata_Me = merge(tumorMetadata_Me, filtered_Me, by.x=1, by.y=0)
+rownames(filtered_metadata_Me) = filtered_metadata_Me[,1]
+names(filtered_metadata_Me) = c(as.character(colnames(tumorMetadata_Me)), as.character(colnames(filtered_t_Me)))
+tumorLabels_Me = as.character(filtered_metadata_Me$Mesenchymal)
+plottingColors = c("Red", "cadetblue")
+names(plottingColors) = unique(tumorLabels_Me)
+
+# t-SNE All DEG #
+Tsne = Rtsne(as.matrix(filtered_Me),perplexity = 30, theta = 0, max_iter = 5000)
+
+pdf('Integrative - tSNE_Mesenchymal_All_DEG.pdf')
+plot(Tsne$Y, main="t-SNE Mesenchymal vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Me], pch=19)
+legend('topleft', legend = unique(tumorLabels_Me), fill=plottingColors[unique(tumorLabels_Me)], border=T, title='Subtype')
+dev.off()
+
+# t-SNE Panel #
+filt_centr_Me = MetGen[which(colnames(MetGen) %in% CLProbes | colnames(MetGen) %in% CLGenes)]
+Tsne = Rtsne(as.matrix(filt_centr_Me),perplexity = 20, theta = 0, max_iter = 5000)
+
+pdf('Integrative - tSNE_5_Probes_Mesenchymal.pdf')
+plot(Tsne$Y, main="t-SNE Mesenchymal vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Me], pch=19)
+legend('topleft', legend = unique(tumorLabels_Me), fill=plottingColors[unique(tumorLabels_Me)], border=T, title='Subtype')
+dev.off()
+
+
+#### Proneural ####
+pdf("ROC_Proneural_Integrative.pdf")
+Centr100_pn = lapply(1:300,
+                     function(x){
+                       Clin_cl_t = as.data.frame(as.matrix(t(Clin_cl)))
+                       Clin_cl30 = as.data.frame(as.matrix(t(sample(Clin_cl_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin_me_t = as.data.frame(as.matrix(t(Clin_me)))
+                       Clin_me30 = as.data.frame(as.matrix(t(sample(Clin_me_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin_pn_t = as.data.frame(as.matrix(t(Clin_pn)))
+                       Clin_pn30 = as.data.frame(as.matrix(t(sample(Clin_pn_t, min(table(ClinAll$Calculated.subtype))))))
+                       Clin = rbind(Clin_cl30, Clin_me30, Clin_pn30)
+                       
+                       FiltGE = GeneExp_t[which(rownames(GeneExp_t) %in% Clin$Patient.ID),]
+                       FiltGE = FiltGE[,which(colnames(FiltGE) %in% PNGenes)]
+                       FiltGE = scale(FiltGE)
+                       
+                       FiltMet = DNAm_t[which(rownames(DNAm_t) %in% Clin$Patient.ID),]
+                       FiltMet = FiltMet[,which(colnames(FiltMet) %in% PNProbes)]
+                       
+                       
+                       MetGen = merge(FiltGE, FiltMet, by = 0)
+                       rownames(MetGen) = MetGen[,1]
+                       MetGen = MetGen[,-1]
+                       
+                       MetGen90 = MetGen[which(rownames(MetGen) %in% Clin$Patient.ID),]
+                       GBM_t = as.data.frame(as.matrix(t(MetGen90)))
+                       
+                       tumorMetadata_pn = cbind("Patient.ID" = as.character(Clin$Patient.ID), "Proneural" = as.character(Clin$Proneural))
+                       filtered_t_pn = MetGen90[,which(colnames(MetGen90)%in%PNGenes | colnames(MetGen90) %in% PNProbes)]
+                       filtered_pntadata_pn = merge(tumorMetadata_pn, filtered_t_pn, by.x=1, by.y=0)
+                       names(filtered_pntadata_pn) = c(as.character(colnames(tumorMetadata_pn)), as.character(colnames(filtered_t_pn)))
+                       tumorLabels_pn = as.character(filtered_pntadata_pn$Proneural)
+                       plottingColors = c("Red", "cadetblue")
+                       names(plottingColors) = unique(tumorLabels_pn)
+                       
+                       filtered_pntadata_t_pn = as.data.frame(as.matrix(t(filtered_pntadata_pn)))
+                       filtered_pnean_pn = filtered_pntadata_pn[,-c(1,2)]
+                       filtered_pnean_t_pn = as.data.frame(as.matrix(t(filtered_pnean_pn)))
+                       
+                       
+                       data_All = list(x = as.matrix(filtered_pnean_t_pn), y = as.vector(tumorLabels_pn), 
+                                       geneid = rownames(filtered_pnean_t_pn),
+                                       genenames = paste("g",as.character(1:nrow(filtered_pnean_t_pn)),sep=""))
+                       
+                       training_All = pamr.train(data_All, threshold = 0)
+                       valid_All = pamr.cv(training_All, data_All)
+                       valid_prob_Best1 = as.data.frame(valid_All$prob)
+                       scores_Best1=valid_prob_Best1[,2]
+                       ROCR.simple_Best1 = list(predictions=scores_Best1, labels=tumorLabels_pn)
+                       pred_Best1 = prediction(ROCR.simple_Best1$predictions, ROCR.simple_Best1$labels)
+                       perf_Best1 = performance(pred_Best1,"tpr","fpr")
+                       perfAUC_Best1 = performance(pred_Best1,"tpr","fpr", measure="auc")
+                       
+                       AUC_Col = as.data.frame(cbind(perfAUC_Best1@y.values))
+                       AUC_Col$Col = NA
+                       AUC_Col$Col[which(AUC_Col > 0.7)] = colorROC[1]
+                       AUC_Col$Col[which(AUC_Col > 0.8)] = colorROC[2]
+                       AUC_Col$Col[which(AUC_Col > 0.825)] = colorROC[3]
+                       AUC_Col$Col[which(AUC_Col > 0.85)] = colorROC[4]
+                       AUC_Col$Col[which(AUC_Col > 0.875)] = colorROC[5]
+                       AUC_Col$Col[which(AUC_Col > 0.9)] = colorROC[6]
+                       AUC_Col$Col[which(AUC_Col > 0.925)] = colorROC[7]
+                       AUC_Col$Col[which(AUC_Col > 0.95)] = colorROC[8]
+                       AUC_Col$Col[which(AUC_Col > 0.975)] = colorROC[9]
+                       plot(perf_Best1, col = AUC_Col$Col, xlim=c(0,1), ylim=c(0,1), lwd = 2)
+                       par(new=TRUE)
+                       list(PNGenes, valid_All$error, training_All$centroids, training_All$sd, valid_All, perfAUC_Best1@y.values)               
+                     })
+dev.off()
+par(new=FALSE)
+
+# Obtain centroids #
+centrList_pn = sapply(1:length(Centr100_pn),
+                      function(x){
+                        list(Centr100_pn[[x]][[3]])
+                      })
+centrPN = Reduce("+", centrList_pn)/length(Centr100_pn)
+
+SDListCL = sapply(1:length(Centr100_pn),
+                  function(x){
+                    list(Centr100_pn[[x]][[4]])
+                  })
+
+PNSD = Reduce("+", SDListCL)/length(Centr100_pn)
+
+error_pn = sapply(1:length(Centr100_pn),
+                  function(x){
+                    list(Centr100_pn[[x]][[2]])
+                  })
+mean(unlist(error_pn))
+write.table(error_pn, file="Integrative - Error_rate_Proneural.csv", sep=";")
+
+AUC_pn = sapply(1:length(Centr100_pn),
+                function(x){
+                  list(Centr100_pn[[x]][[6]][[1]])
+                })
+mean(unlist(AUC_pn))
+write.table(AUC_pn, file="Integrative - AUC_Proneural.csv", sep=";")
+
+# "Synthetic" Centroid #
+centrPN = cbind(centrPN, centrPN[,1]+0.0000001, centrPN[,2]+0.0000001, centrPN[,1]-0.0000001, centrPN[,2]-0.0000001) # Add more than one column to the centroid, and then we will add the SD manuAlly
+write.table(PNSD, file="Integrative - Proneural_SD.csv", sep=";")
+write.table(centrPN, file="Integrative - Proneural_centroids.csv", sep=";")
+
+#### Figures Proneural ####
+setwd("D:/R/GBM-LGG/GBM Subtypes")
+GE_genes = read.table("DEG_Proneural.csv", sep = ";")
+setwd("D:/R/GBM-LGG/GBM Subtypes/DNAm")
+DNAm_probes = read.table("DMS_Proneural.csv", sep = ";")
+setwd("D:/R/GBM-LGG/GBM Subtypes/Integrative")
+
+filtered_Pn = MetGen[which(colnames(MetGen) %in% GE_genes$Row.names | colnames(MetGen) %in% DNAm_probes$Row.names)]
+
+tumorMetadata_Pn = cbind("barcode" = as.character(ClinAll$Patient.ID), "Proneural" = as.character(ClinAll$Proneural))
+filtered_t_Pn = as.data.frame(as.matrix(t(filtered_Pn)))
+filtered_metadata_Pn = merge(tumorMetadata_Pn, filtered_Pn, by.x=1, by.y=0)
+rownames(filtered_metadata_Pn) = filtered_metadata_Pn[,1]
+names(filtered_metadata_Pn) = c(as.character(colnames(tumorMetadata_Pn)), as.character(colnames(filtered_t_Pn)))
+tumorLabels_Pn = as.character(filtered_metadata_Pn$Proneural)
+plottingColors = c("Red", "cadetblue")
+names(plottingColors) = unique(tumorLabels_Pn)
+
+# t-SNE All DEG #
+Tsne = Rtsne(as.matrix(filtered_Pn),perplexity = 20, theta = 0, max_iter = 5000)
+
+pdf('Integrative - tSNE_Proneural_All_DEG.pdf')
+plot(Tsne$Y, main="t-SNE Proneural vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Pn], pch=19)
+legend('topleft', legend = unique(tumorLabels_Pn), fill=plottingColors[unique(tumorLabels_Pn)], border=T, title='Subtype')
+dev.off()
+
+# t-SNE Panel #
+filt_centr_Pn = MetGen[which(colnames(MetGen) %in% CLProbes | colnames(MetGen) %in% CLGenes)]
+Tsne = Rtsne(as.matrix(filt_centr_Pn),perplexity = 20, theta = 0, max_iter = 5000)
+
+pdf('Integrative - tSNE_5_Probes_Proneural.pdf')
+plot(Tsne$Y, main="t-SNE Proneural vs Control", xlab="t-SNE Component 1", ylab="t-SNE Component 2", col=plottingColors[tumorLabels_Pn], pch=19)
+legend('topleft', legend = unique(tumorLabels_Pn), fill=plottingColors[unique(tumorLabels_Pn)], border=T, title='Subtype')
+dev.off()
+
+
+#### VALIDATION ####
+setwd("D:/R/GBM-LGG/GBM Subtypes")
+ClinAll = read.csv("Clinical_Data_TCGA.csv", sep=";", header=TRUE) # Clinical Data downlaoded from cBioPortal and curated in Excel
+GeneExp = read.table("GBM_u133.txt", sep="\t", header=TRUE, row.names=1) # Downloaded from Firehose
+colnames(GeneExp)=substr(colnames(GeneExp), 1, 12)
+GeneExp = GeneExp[-1,]
+DNAm=read.table("Methylation_27_450_GEO.csv", sep=";", row.names=1, header=TRUE)
+DNAm = log2(DNAm/(1-DNAm)) 
+barcode = read.table("Barcodes_27_450_GEO.csv", sep=";", header = TRUE) # Excel file that we have created containing barcode and "batch" of each patient in this new cohort (it will be different for each person since it depends on random sampling)
+colnames(DNAm) = barcode$Barcode # Only to remove the "prefix"
+
+setwd("D:/R/GBM-LGG/GBM Subtypes/DNAm")
+barcTrain = read.table("Training_Barcodes.csv", sep = ";")[,1]
+setwd("D:/R/GBM-LGG/GBM Subtypes/Integrative")
+GeneExp = GeneExp[,which(!colnames(GeneExp)%in%barcTrain)]
+GeneExp = data.frame(apply(GeneExp, 2, function(x) as.numeric(as.character(x))), row.names = rownames(GeneExp))
+GeneExp_t = as.data.frame(as.matrix(t(GeneExp)))
+
+DNAm = DNAm[,which(colnames(DNAm)%in%colnames(GeneExp))]
+DNAm = data.frame(apply(DNAm, 2, function(x) as.numeric(as.character(x))), row.names = rownames(DNAm))
+DNAm_t = as.data.frame(as.matrix(t(DNAm)))
+
+MetGen = merge(GeneExp_t, DNAm_t, by = 0)
+rownames(MetGen) = MetGen[,1]
+MetGen = MetGen[,-1]
+
+GBM_val = MetGen[which(!colnames(MetGen)%in%barcTrain)]
+GBM_val_t=as.data.frame(as.matrix(t(GBM_val)))
+
+MetaVal = ClinAll[which(ClinAll$Patient.ID %in% rownames(MetGen)),]
+MetaVal = MetaVal[which(colnames(MetaVal) %in% c("Patient.ID", "Calculated.subtype"))]
+
+#### Classical ####
+centrCL = read.table("Integrative - Classical_centroids.csv", sep=";", header=TRUE, row.names=1)
+centrCL = centrCL[order(rownames(centrCL)),]
+CLSD = read.table("Integrative - Classical_SD.csv", sep=";")
+CLSD = CLSD[order(rownames(CLSD)),]
+data_centrCL = list(x = as.matrix(centrCL), y = as.vector(c("Classical", "Control", "Classical", "Control", "Classical", "Control")), geneid = rownames(centrCL),genenames = paste("g",as.character(1:nrow(centrCL)),sep=""))
+train_centrCL = pamr.train(data_centrCL, threshold = 0)
+train_centrCL$sd = CLSD
+
+# Predict subtype classical
+GBM_val_cl = GBM_val_t[which(rownames(GBM_val_t)%in%rownames(centrCL)),]
+GBM_val_cl = GBM_val_cl[order(rownames(GBM_val_cl)),]
+prediction_0_cl = pamr.predict(train_centrCL, GBM_val_cl, threshold = 0,
+                               type = c("posterior"))
+
+#### Mesenchymal ####
+centrME = read.table("Integrative - Mesenchymal_centroids.csv", sep=";", header=TRUE, row.names=1)
+centrME = centrME[order(rownames(centrME)),]
+MESD = read.table("Integrative - Mesenchymal_SD.csv", sep=";")
+MESD = MESD[order(rownames(MESD)),]
+data_centrME = list(x = as.matrix(centrME), y = as.vector(c("Control", "Mesenchymal", "Control", "Mesenchymal", "Control", "Mesenchymal")), geneid = rownames(centrME),genenames = paste("g",as.character(1:nrow(centrME)),sep=""))
+train_centrME = pamr.train(data_centrME, threshold = 0)
+train_centrME$sd = MESD
+
+# Predict subtype Mesenchymal
+GBM_val_me = GBM_val_t[which(rownames(GBM_val_t)%in%rownames(centrME)),]
+GBM_val_me = GBM_val_me[order(rownames(GBM_val_me)),]
+prediction_0_me = pamr.predict(train_centrME, GBM_val_me, threshold = 0,
+                               type = c("posterior"))
+
+CL_ME = merge(prediction_0_cl, prediction_0_me, by=0)
+rownames(CL_ME) = CL_ME[,1]
+CL_ME = CL_ME[,-c(1,3,4)]
+
+#### Proneural ####
+centrPN = read.table("Integrative - Proneural_centroids.csv", sep=";", header=TRUE, row.names=1)
+centrPN = centrPN[order(rownames(centrPN)),]
+PNSD = read.table("Integrative - Proneural_SD.csv", sep=";")
+PNSD = PNSD[order(rownames(PNSD)),]
+data_centrPN = list(x = as.matrix(centrPN), y = as.vector(c("Control", "Proneural", "Control", "Proneural", "Control", "Proneural")), geneid = rownames(centrPN),genenames = paste("g",as.character(1:nrow(centrPN)),sep=""))
+train_centrPN = pamr.train(data_centrPN, threshold = 0)
+valid_centrPN = pamr.cv(train_centrPN, data_centrPN)
+train_centrPN$sd = PNSD
+
+# Predict subtype Proneural
+GBM_val_pn = GBM_val_t[which(rownames(GBM_val_t)%in%rownames(centrPN)),]
+GBM_val_pn = GBM_val_pn[order(rownames(GBM_val_pn)),]
+prediction_0_pn = pamr.predict(train_centrPN, GBM_val_pn, threshold = 0,
+                               type = c("posterior"))
+
+All = merge(CL_ME, prediction_0_pn, by=0)
+rownames(All)=All[,1]
+All = All[,-c(1,4)]
+All_class = merge(All, MetaVal, by.x=0, by.y=1)
+rownames(All_class)=All_class[,1]
+All_class = All_class[,c(2,3,4,5)]
+write.table(All_class, file="Integrative - Validation_Classified_by_Centroids.csv", sep=";")
