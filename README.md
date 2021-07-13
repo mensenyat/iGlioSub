@@ -3,5 +3,7 @@ Glioblastoma (GBM) is the most aggressive and prevalent form of primary brain tu
 
 **Order of the scripts**
 1- Merge 27k-450k-GEO and Correct Batch Effect.R
+
 2- Main Script - Create GeneExp, DNAm and Integrative Panels and Validate.R
+
 The other two scripts (Error Rate and AUC Radar Plots.R and Create GSEA and GREAT Plots.R) must be used after the main script. Please remind that to create the GSEA and GREAT plots, the enriched pathways must be obtained using Metascape and GREAT tools.
